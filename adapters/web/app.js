@@ -4,7 +4,9 @@ const state = {
   baseUrl: localStorage.getItem("codexControlPlaneUrl") || defaultBaseUrl(),
   conversationId: "",
   socket: null,
-  pendingMessages: []
+  pendingMessages: [],
+  collapsedSections: loadJson("codexCollapsedSections", {}),
+  sidebarWidth: Number(localStorage.getItem("codexSidebarWidth")) || 300,
 };
 
 const els = {
@@ -20,8 +22,13 @@ const els = {
   interrupt: document.getElementById("interrupt"),
   sidebarToggle: document.getElementById("sidebarToggle"),
   sidebar: document.getElementById("sidebar"),
+  resizeHandle: document.getElementById("resizeHandle"),
+  app: document.getElementById("app"),
 };
 
+// ── Init ──
+
+applySidebarWidth();
 els.controlPlaneUrl.value = state.baseUrl.replace(/^https?:\/\//, "");
 els.controlPlaneUrl.addEventListener("change", saveBaseUrl);
 els.refreshThreads.addEventListener("click", loadThreads);
@@ -29,14 +36,16 @@ els.composer.addEventListener("submit", sendMessage);
 els.interrupt.addEventListener("click", interruptTurn);
 els.messageInput.addEventListener("input", autoResize);
 els.sidebarToggle.addEventListener("click", () => els.sidebar.classList.toggle("open"));
+initResize();
 
 loadThreads();
 
+/* ── API ── */
+
 function defaultBaseUrl() {
-  if (location.protocol === "http:" || location.protocol === "https:") {
-    return `${location.protocol}//${location.hostname}:8787`;
-  }
-  return "http://127.0.0.1:8787";
+  return (location.protocol === "http:" || location.protocol === "https:")
+    ? `${location.protocol}//${location.hostname}:8787`
+    : "http://127.0.0.1:8787";
 }
 
 function saveBaseUrl() {
@@ -48,18 +57,16 @@ function saveBaseUrl() {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(`${state.baseUrl}${path}`, {
+  const res = await fetch(`${state.baseUrl}${path}`, {
     ...options,
     headers: { "content-type": "application/json", ...(options.headers || {}) }
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(data.message || data.error || `HTTP ${response.status}`);
-  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || data.error || `HTTP ${res.status}`);
   return data;
 }
 
-/* ── Thread list ── */
+/* ── Thread list with grouping ── */
 
 async function loadThreads() {
   try {
@@ -70,12 +77,96 @@ async function loadThreads() {
       els.threads.innerHTML = '<div class="empty-state">暂无会话</div>';
       return;
     }
-    for (const thread of threads) {
-      els.threads.appendChild(buildThreadCard(thread));
-    }
+    renderGroupedThreads(threads);
   } catch (error) {
     setStatus(error.message);
   }
+}
+
+function renderGroupedThreads(threads) {
+  const groups = groupByWorkspace(threads);
+  const order = Object.keys(groups).sort((a, b) => {
+    if (a === "无工作目录") return 1;
+    if (b === "无工作目录") return -1;
+    const ma = maxUpdated(groups[a]), mb = maxUpdated(groups[b]);
+    return (mb || 0) - (ma || 0);
+  });
+
+  for (const name of order) {
+    els.threads.appendChild(buildSection(name, groups[name]));
+  }
+}
+
+function groupByWorkspace(threads) {
+  const groups = Object.create(null);
+  for (const t of threads) {
+    const ws = workspaceLabel(t.cwd);
+    (groups[ws] || (groups[ws] = [])).push(t);
+  }
+  // Sort threads within each group by updatedAt desc
+  for (const list of Object.values(groups)) {
+    list.sort((a, b) => cmpDesc(a.updatedAt, b.updatedAt));
+  }
+  return groups;
+}
+
+function workspaceLabel(cwd) {
+  if (!cwd) return "无工作目录";
+  const s = String(cwd).replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("\\"), s.lastIndexOf("/"));
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+function maxUpdated(list) {
+  let max = 0;
+  for (const t of list) {
+    const v = Date.parse(t.updatedAt);
+    if (Number.isFinite(v) && v > max) max = v;
+  }
+  return max;
+}
+
+function cmpDesc(a, b) {
+  const da = Date.parse(a), db = Date.parse(b);
+  return (Number.isFinite(db) ? db : 0) - (Number.isFinite(da) ? da : 0);
+}
+
+/* ── Section DOM ── */
+
+function buildSection(name, threads) {
+  const key = `ws-${name}`;
+  const collapsed = state.collapsedSections[key] === true;
+
+  const section = document.createElement("div");
+  section.className = "ws-section" + (collapsed ? " collapsed" : "");
+
+  // Header
+  const header = document.createElement("div");
+  header.className = "ws-header";
+  header.title = threads[0]?.cwd || name;
+  header.innerHTML =
+    `<span class="ws-chevron"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 1l5 4-5 4" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span>` +
+    `<span class="ws-name">${esc(name)}</span>` +
+    `<span class="ws-count">${threads.length}</span>`;
+  header.addEventListener("click", () => toggleSection(section, key));
+
+  // Items
+  const items = document.createElement("div");
+  items.className = "ws-items";
+
+  for (const t of threads) {
+    items.appendChild(buildThreadCard(t));
+  }
+
+  section.appendChild(header);
+  section.appendChild(items);
+  return section;
+}
+
+function toggleSection(section, key) {
+  const collapsed = section.classList.toggle("collapsed");
+  state.collapsedSections[key] = collapsed;
+  saveJson("codexCollapsedSections", state.collapsedSections);
 }
 
 function buildThreadCard(thread) {
@@ -95,10 +186,7 @@ function buildThreadCard(thread) {
   if (thread.runtimeStatus === "running") dot.classList.add("running");
 
   const info = document.createElement("span");
-  const parts = [];
-  if (thread.updatedAt) parts.push(relativeTime(thread.updatedAt));
-  if (thread.cwd) parts.push(baseName(thread.cwd));
-  info.textContent = parts.join("  ·  ") || "—";
+  info.textContent = thread.updatedAt ? relativeTime(thread.updatedAt) : "—";
 
   meta.appendChild(dot);
   meta.appendChild(info);
@@ -115,15 +203,13 @@ async function openThread(thread) {
   els.interrupt.disabled = false;
 
   for (const card of els.threads.querySelectorAll(".thread-card")) {
-    const isActive = card.querySelector(".thread-title").textContent === els.currentTitle.textContent;
-    card.classList.toggle("active", isActive);
+    card.classList.toggle("active",
+      card.querySelector(".thread-title").textContent === els.currentTitle.textContent);
   }
   els.messages.innerHTML = "";
   state.pendingMessages = [];
   connectEvents();
   await loadHistory();
-
-  // Close sidebar on mobile after selection
   if (window.innerWidth <= 720) els.sidebar.classList.remove("open");
 }
 
@@ -141,15 +227,10 @@ async function loadHistory() {
 
 function renderHistory(stateData) {
   els.messages.innerHTML = "";
-  const turns = stateData && Array.isArray(stateData.turns) ? stateData.turns : [];
-  if (turns.length === 0) {
-    els.messages.innerHTML = '<div class="empty-state">暂无历史消息</div>';
-    return;
-  }
+  const turns = (stateData && stateData.turns) || [];
+  if (!turns.length) { els.messages.innerHTML = '<div class="empty-state">暂无历史消息</div>'; return; }
   for (const turn of turns) {
-    for (const item of turn.items || []) {
-      appendItem(item);
-    }
+    for (const item of turn.items || []) appendItem(item);
   }
   prunePendingMessages(stateData);
   for (const p of state.pendingMessages) appendPendingMessage(p);
@@ -168,17 +249,17 @@ function appendItem(item) {
 
 async function sendMessage(event) {
   event.preventDefault();
-  const message = els.messageInput.value.trim();
-  if (!state.conversationId || !message) return;
+  const msg = els.messageInput.value.trim();
+  if (!state.conversationId || !msg) return;
   els.send.disabled = true;
-  const pending = addPendingMessage(message);
+  const pending = addPendingMessage(msg);
   els.messageInput.value = "";
   els.messageInput.style.height = "auto";
   setStatus("");
   try {
     const result = await api("/send", {
       method: "POST",
-      body: JSON.stringify({ conversationId: state.conversationId, message })
+      body: JSON.stringify({ conversationId: state.conversationId, message: msg })
     });
     if (result.ok !== true) throw new Error(result.error || "发送失败");
   } catch (error) {
@@ -208,7 +289,7 @@ function connectEvents() {
   if (state.socket) state.socket.close();
   const wsUrl = `${state.baseUrl.replace(/^http/, "ws")}/events?conversationId=${encodeURIComponent(state.conversationId)}`;
   state.socket = new WebSocket(wsUrl);
-  state.socket.onmessage = (event) => handleEvent(JSON.parse(event.data));
+  state.socket.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch {} };
   state.socket.onclose = () => setStatus("");
   state.socket.onerror = () => setStatus("");
 }
@@ -235,15 +316,15 @@ function appendMessage(role, text) {
 }
 
 function addPendingMessage(text) {
-  const pending = { id: `p-${Date.now()}-${Math.random().toString(16).slice(2)}`, text };
-  state.pendingMessages.push(pending);
+  const p = { id: `p-${Date.now()}-${Math.random().toString(16).slice(2)}`, text };
+  state.pendingMessages.push(p);
   const div = document.createElement("div");
   div.className = "msg user pending";
-  div.dataset.pendingId = pending.id;
-  div.textContent = pending.text;
+  div.dataset.pendingId = p.id;
+  div.textContent = p.text;
   els.messages.appendChild(div);
   scrollBottom();
-  return pending;
+  return p;
 }
 
 function removePendingMessage(id) {
@@ -270,6 +351,43 @@ function hasPendingText(text) {
   return state.pendingMessages.some(p => p.text === text);
 }
 
+/* ── Resize ── */
+
+function initResize() {
+  let dragging = false;
+  let startX = 0, startW = 0;
+
+  els.resizeHandle.addEventListener("mousedown", (e) => {
+    dragging = true;
+    startX = e.clientX;
+    startW = state.sidebarWidth;
+    els.resizeHandle.classList.add("active");
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  });
+
+  document.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const w = Math.max(220, Math.min(500, startW + (e.clientX - startX)));
+    state.sidebarWidth = w;
+    applySidebarWidth();
+  });
+
+  document.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    els.resizeHandle.classList.remove("active");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    localStorage.setItem("codexSidebarWidth", state.sidebarWidth);
+  });
+}
+
+function applySidebarWidth() {
+  els.app.style.setProperty("--sidebar-w", state.sidebarWidth + "px");
+}
+
 /* ── Helpers ── */
 
 function relativeTime(value) {
@@ -283,12 +401,6 @@ function relativeTime(value) {
   return `${Math.floor(diff / 86400e3)} 天前`;
 }
 
-function baseName(p) {
-  const s = String(p || "").replace(/[\\/]+$/, "");
-  const i = Math.max(s.lastIndexOf("\\"), s.lastIndexOf("/"));
-  return i >= 0 ? s.slice(i + 1) : s;
-}
-
 function autoResize() {
   const el = els.messageInput;
   el.style.height = "auto";
@@ -300,7 +412,19 @@ function setStatus(text) {
 }
 
 function scrollBottom() {
-  requestAnimationFrame(() => {
-    els.messages.scrollTop = els.messages.scrollHeight;
-  });
+  requestAnimationFrame(() => { els.messages.scrollTop = els.messages.scrollHeight; });
+}
+
+function esc(s) {
+  const div = document.createElement("div");
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+function loadJson(key, fallback) {
+  try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch { return fallback; }
+}
+
+function saveJson(key, value) {
+  localStorage.setItem(key, JSON.stringify(value));
 }

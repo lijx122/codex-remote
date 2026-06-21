@@ -67,7 +67,7 @@ class CodexFollowerCore {
           title: item.thread_name || item.title || null,
           updatedAt: item.updated_at || item.updatedAt || null,
           sessionId: item.session_id || item.sessionId || null,
-          cwd: item.cwd || null,
+          cwd: item.cwd || this.getThreadCwd(item.id),
           runtimeStatus: null,
           raw: item
         });
@@ -76,6 +76,41 @@ class CodexFollowerCore {
       }
     }
     return threads;
+  }
+
+  getThreadCwd(threadId) {
+    // Check cache from broadcasts first
+    const cached = this.threads.get(threadId);
+    if (cached && cached.cwd) return cached.cwd;
+
+    // Read first line of rollout file for session_meta.cwd
+    const rolloutPath = this.findRolloutPath(threadId);
+    if (!rolloutPath) return null;
+
+    try {
+      const fd = fs.openSync(rolloutPath, "r");
+      let buf = Buffer.alloc(0);
+      const chunk = Buffer.alloc(65536);
+      let bytesRead;
+      while ((bytesRead = fs.readSync(fd, chunk, 0, chunk.length, buf.length)) > 0) {
+        buf = Buffer.concat([buf, chunk.subarray(0, bytesRead)]);
+        const newline = buf.indexOf(10); // \n
+        if (newline >= 0) {
+          fs.closeSync(fd);
+          const firstLine = buf.toString("utf8", 0, newline);
+          const entry = JSON.parse(firstLine);
+          if (entry.type === "session_meta" && entry.payload && entry.payload.cwd) {
+            return entry.payload.cwd;
+          }
+          return null;
+        }
+        if (buf.length > 524288) break; // safety: 512KB max for first line
+      }
+      fs.closeSync(fd);
+    } catch {
+      // Locked or malformed file
+    }
+    return null;
   }
 
   async loadHistory(conversationId) {
