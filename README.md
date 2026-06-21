@@ -3,6 +3,7 @@
 通过微信和 Web 远程控制 Windows 上的 Codex Desktop。查看会话、发送消息、打断执行，无需独立 app-server 接管。
 
 **仅支持 Windows。** 依赖 Codex Desktop 的 `\\.\pipe\codex-ipc` 命名管道。
+作者本人无mac，无法进行适配。
 
 ## 架构
 
