@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Web Adapter</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <strong>Codex</strong>
+      <input id="controlPlaneUrl" placeholder="http://电脑IP:8787" />
+      <button id="saveUrl">保存</button>
+    </header>
+
+    <main>
+      <section id="threadsPane">
+        <div class="bar">
+          <span>会话</span>
+          <button id="refreshThreads">刷新</button>
+        </div>
+        <div id="threads"></div>
+      </section>
+
+      <section id="chatPane">
+        <div class="bar">
+          <span id="currentTitle">未选择会话</span>
+          <button id="interrupt">Stop</button>
+        </div>
+        <div id="status"></div>
+        <div id="messages"></div>
+        <div id="approvalBox" hidden>
+          <span id="approvalText">Approval required</span>
+          <button id="approveYes">Approve</button>
+          <button id="approveNo">Deny</button>
+        </div>
+        <form id="composer">
+          <textarea id="messageInput" rows="2" placeholder="输入消息"></textarea>
+          <button id="send" type="submit">发送</button>
+        </form>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

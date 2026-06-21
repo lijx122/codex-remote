@@ -1,0 +1,13 @@
+{
+  "name": "codex-follower-core",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "require": "./src/index.js"
+    }
+  }
+}

@@ -1,0 +1,330 @@
+"use strict";
+
+const http = require("node:http");
+const crypto = require("node:crypto");
+const fs = require("node:fs/promises");
+const path = require("node:path");
+const { URL } = require("node:url");
+const { createCodexFollower } = require("../../codex-follower-core/src");
+
+const EVENT_TYPES = new Set([
+  "message",
+  "turn_started",
+  "turn_completed",
+  "approval_request",
+  "approval_response",
+  "interrupt",
+  "thread_state_changed",
+  "error"
+]);
+
+const WEB_ADAPTER_DIR = path.resolve(__dirname, "..", "..", "..", "adapters", "web");
+const STATIC_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8"
+};
+
+function createControlPlaneServer(options = {}) {
+  const core = options.core || createCodexFollower(options.coreOptions || {});
+  const clients = new Set();
+  let connected = false;
+  let connecting = null;
+
+  function logCommand(name, detail) {
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      layer: "control-plane",
+      command: name,
+      ...detail
+    }));
+  }
+
+  async function ensureConnected() {
+    if (connected) return;
+    if (!connecting) {
+      connecting = core.connect()
+        .then(() => {
+          connected = true;
+        })
+        .finally(() => {
+          connecting = null;
+        });
+    }
+    await connecting;
+  }
+
+  async function sendJson(res, status, body) {
+    const json = JSON.stringify(body);
+    res.writeHead(status, {
+      "content-type": "application/json; charset=utf-8",
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET,POST,OPTIONS",
+      "access-control-allow-headers": "content-type",
+      "cache-control": "no-store",
+      "content-length": Buffer.byteLength(json)
+    });
+    res.end(json);
+  }
+
+  async function sendStatic(res, pathname) {
+    const relativePath = pathname === "/" ? "index.html" : decodeURIComponent(pathname.slice(1));
+    const filePath = path.resolve(WEB_ADAPTER_DIR, relativePath);
+    if (!filePath.startsWith(WEB_ADAPTER_DIR + path.sep)) {
+      await sendJson(res, 404, { error: "not found" });
+      return;
+    }
+
+    try {
+      const body = await fs.readFile(filePath);
+      res.writeHead(200, {
+        "content-type": STATIC_TYPES[path.extname(filePath)] || "application/octet-stream",
+        "cache-control": "no-store",
+        "content-length": body.length
+      });
+      res.end(body);
+    } catch (error) {
+      await sendJson(res, 404, { error: "not found" });
+    }
+  }
+
+  async function readJson(req) {
+    const chunks = [];
+    for await (const chunk of req) {
+      chunks.push(chunk);
+    }
+    if (chunks.length === 0) return {};
+    const raw = Buffer.concat(chunks).toString("utf8");
+    return raw ? JSON.parse(raw) : {};
+  }
+
+  function normalizeError(error) {
+    return {
+      type: "error",
+      message: error && error.message ? error.message : String(error),
+      response: error && error.response ? error.response : undefined
+    };
+  }
+
+  function toWireEvent(event) {
+    return {
+      type: EVENT_TYPES.has(event.type) ? event.type : "error",
+      conversationId: event.conversationId || null,
+      payload: { ...event, type: undefined, conversationId: undefined }
+    };
+  }
+
+  async function handleRequest(req, res) {
+    const url = new URL(req.url || "/", "http://127.0.0.1");
+
+    try {
+      if (req.method === "OPTIONS") {
+        await sendJson(res, 204, {});
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/health") {
+        await sendJson(res, 200, { ok: true, connected });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/threads") {
+        await ensureConnected();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await sendJson(res, 200, core.listThreads().map((thread) => ({
+          conversationId: thread.id,
+          title: thread.title || thread.id,
+          updatedAt: thread.updatedAt || null
+        })));
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname.startsWith("/history/")) {
+        await ensureConnected();
+        const conversationId = decodeURIComponent(url.pathname.slice("/history/".length));
+        const result = await core.loadHistory(conversationId);
+        await sendJson(res, 200, {
+          conversationId,
+          revision: result.revision,
+          state: result.state
+        });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/send") {
+        await ensureConnected();
+        const body = await readJson(req);
+        logCommand("send", {
+          conversationId: body.conversationId,
+          messageLength: typeof body.message === "string" ? body.message.length : 0
+        });
+        const result = await core.sendMessage(body.conversationId, body.message);
+        logCommand("send.result", {
+          conversationId: body.conversationId,
+          ok: result.ok
+        });
+        await sendJson(res, result.ok ? 200 : 502, { ok: result.ok, raw: result.raw });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/interrupt") {
+        await ensureConnected();
+        const body = await readJson(req);
+        logCommand("interrupt", { conversationId: body.conversationId });
+        const result = await core.interrupt(body.conversationId);
+        logCommand("interrupt.result", { conversationId: body.conversationId, ok: result.ok });
+        await sendJson(res, 200, { ok: result.ok });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/approve") {
+        await ensureConnected();
+        const body = await readJson(req);
+        const decision = body.decision === true || body.decision === "allow" ? "allow" : "deny";
+        logCommand("approve", {
+          conversationId: body.conversationId,
+          approvalId: body.approvalId,
+          decision
+        });
+        const result = await core.approve(body.conversationId, body.approvalId, decision);
+        logCommand("approve.result", { conversationId: body.conversationId, ok: result.ok });
+        await sendJson(res, 200, { ok: result.ok });
+        return;
+      }
+
+      if (req.method === "GET") {
+        await sendStatic(res, url.pathname);
+        return;
+      }
+
+      await sendJson(res, 404, { error: "not found" });
+    } catch (error) {
+      console.error(JSON.stringify({
+        ts: new Date().toISOString(),
+        layer: "control-plane",
+        error: error && error.message ? error.message : String(error)
+      }));
+      await sendJson(res, 500, normalizeError(error));
+    }
+  }
+
+  const server = http.createServer(handleRequest);
+
+  server.on("upgrade", async (req, socket) => {
+    const url = new URL(req.url || "/", "http://127.0.0.1");
+    if (url.pathname !== "/events") {
+      socket.destroy();
+      return;
+    }
+
+    const conversationId = url.searchParams.get("conversationId");
+    if (!conversationId) {
+      socket.destroy();
+      return;
+    }
+
+    const key = req.headers["sec-websocket-key"];
+    if (!key) {
+      socket.destroy();
+      return;
+    }
+
+    const accept = crypto
+      .createHash("sha1")
+      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest("base64");
+
+    socket.write([
+      "HTTP/1.1 101 Switching Protocols",
+      "Upgrade: websocket",
+      "Connection: Upgrade",
+      `Sec-WebSocket-Accept: ${accept}`,
+      "",
+      ""
+    ].join("\r\n"));
+
+    const client = createWebSocketClient(socket, conversationId);
+    clients.add(client);
+    client.subscription = core.subscribeEvents(conversationId);
+    client.subscription.on("*", (event) => client.send(toWireEvent(event)));
+    client.send({ type: "connected", conversationId: client.conversationId || null, payload: {} });
+
+    socket.on("close", () => {
+      if (client.subscription && client.subscription.unsubscribe) {
+        client.subscription.unsubscribe();
+      }
+      clients.delete(client);
+    });
+    socket.on("error", () => {
+      if (client.subscription && client.subscription.unsubscribe) {
+        client.subscription.unsubscribe();
+      }
+      clients.delete(client);
+    });
+
+    try {
+      await ensureConnected();
+      await core.loadHistory(client.conversationId);
+    } catch (error) {
+      client.send({ type: "error", conversationId: client.conversationId || null, payload: normalizeError(error) });
+    }
+  });
+
+  return {
+    server,
+    core,
+    listen(port, host) {
+      return new Promise((resolve) => {
+        server.listen(port, host, () => resolve(server.address()));
+      });
+    },
+    close() {
+      core.disconnect();
+      for (const client of clients) {
+        client.close();
+      }
+      return new Promise((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
+    }
+  };
+}
+
+function createWebSocketClient(socket, conversationId) {
+  return {
+    conversationId,
+    send(value) {
+      if (socket.destroyed) return;
+      socket.write(encodeWebSocketFrame(JSON.stringify(value)));
+    },
+    close() {
+      if (!socket.destroyed) {
+        socket.end();
+      }
+    }
+  };
+}
+
+function encodeWebSocketFrame(text) {
+  const payload = Buffer.from(text, "utf8");
+  const header = [];
+  header.push(0x81);
+
+  if (payload.length < 126) {
+    header.push(payload.length);
+  } else if (payload.length < 65536) {
+    header.push(126, (payload.length >> 8) & 0xff, payload.length & 0xff);
+  } else {
+    header.push(127, 0, 0, 0, 0);
+    header.push(
+      (payload.length >> 24) & 0xff,
+      (payload.length >> 16) & 0xff,
+      (payload.length >> 8) & 0xff,
+      payload.length & 0xff
+    );
+  }
+
+  return Buffer.concat([Buffer.from(header), payload]);
+}
+
+module.exports = { createControlPlaneServer };

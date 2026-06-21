@@ -1,0 +1,11 @@
+{
+  "name": "codex-follower-cli",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "codex-follower": "bin/codex-follower.js"
+  },
+  "dependencies": {
+    "codex-follower-core": "file:../codex-follower-core"
+  }
+}

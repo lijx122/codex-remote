@@ -1,0 +1,174 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #111;
+  background: #f6f7f8;
+}
+
+header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  background: #fff;
+  border-bottom: 1px solid #ddd;
+}
+
+header strong {
+  flex: 0 0 auto;
+}
+
+input,
+textarea,
+button {
+  font: inherit;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid #bbb;
+  border-radius: 6px;
+  padding: 8px;
+  background: #fff;
+}
+
+button {
+  border: 1px solid #999;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: #fff;
+}
+
+main {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  height: calc(100vh - 54px);
+}
+
+section {
+  min-width: 0;
+  min-height: 0;
+}
+
+#threadsPane {
+  border-right: 1px solid #ddd;
+  background: #fff;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid #ddd;
+  background: #fff;
+}
+
+#threads {
+  overflow: auto;
+  height: calc(100% - 49px);
+}
+
+.thread {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-bottom: 1px solid #eee;
+  border-radius: 0;
+  padding: 12px 10px;
+  background: #fff;
+}
+
+.thread.active {
+  background: #e8f0fe;
+}
+
+#chatPane {
+  display: flex;
+  flex-direction: column;
+}
+
+#status {
+  min-height: 24px;
+  padding: 4px 10px;
+  color: #555;
+  font-size: 13px;
+}
+
+#messages {
+  flex: 1;
+  overflow: auto;
+  padding: 10px;
+}
+
+.msg {
+  white-space: pre-wrap;
+  padding: 8px;
+  margin: 0 0 8px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.msg.user {
+  background: #eef7ee;
+}
+
+.msg.assistant {
+  background: #fff;
+}
+
+.msg.event {
+  color: #555;
+  background: #f0f0f0;
+}
+
+#approvalBox {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-top: 1px solid #ddd;
+  background: #fff6d6;
+}
+
+#approvalBox[hidden] {
+  display: none;
+}
+
+#composer {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  padding: 10px;
+  border-top: 1px solid #ddd;
+  background: #fff;
+}
+
+@media (max-width: 720px) {
+  header {
+    flex-wrap: wrap;
+  }
+
+  main {
+    display: block;
+    height: calc(100vh - 95px);
+  }
+
+  #threadsPane {
+    height: 34%;
+    border-right: 0;
+    border-bottom: 1px solid #ddd;
+  }
+
+  #chatPane {
+    height: 66%;
+  }
+}
