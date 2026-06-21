@@ -134,7 +134,9 @@ function createControlPlaneServer(options = {}) {
         await sendJson(res, 200, core.listThreads().map((thread) => ({
           conversationId: thread.id,
           title: thread.title || thread.id,
-          updatedAt: thread.updatedAt || null
+          updatedAt: thread.updatedAt || null,
+          cwd: thread.cwd || null,
+          runtimeStatus: thread.runtimeStatus || null
         })));
         return;
       }

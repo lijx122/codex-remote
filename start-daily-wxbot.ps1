@@ -2,16 +2,26 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Node = "node"
-
 $LogDir = Join-Path $Root "reports"
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 
+# Read .env for display
+$envPath = Join-Path $Root ".env"
+$hostAddr = "127.0.0.1"
+$port = "8787"
+if (Test-Path $envPath) {
+  Get-Content $envPath | ForEach-Object {
+    if ($_ -match '^\s*CODEX_CONTROL_PLANE_HOST\s*=\s*(.+)$') { $hostAddr = $matches[1].Trim() }
+    if ($_ -match '^\s*CODEX_CONTROL_PLANE_PORT\s*=\s*(.+)$') { $port = $matches[1].Trim() }
+  }
+}
+
 Write-Host "=== Codex Remote ==="
-Write-Host "Web UI : http://127.0.0.1:8787"
+Write-Host "Web UI : http://${hostAddr}:$port"
 Write-Host "WeChat : scan QR if needed"
 Write-Host ""
 
-# Start codex-control-plane (Web UI + REST API)
+# Start codex-control-plane
 $ControlPlaneLog = Join-Path $LogDir "control-plane.log"
 Write-Host "[control-plane] starting..."
 $controlPlaneJob = Start-Job -Name "codex-control-plane" -ScriptBlock {
@@ -20,7 +30,7 @@ $controlPlaneJob = Start-Job -Name "codex-control-plane" -ScriptBlock {
   & $node tools\codex-control-plane.js *>> $log
 } -ArgumentList $Node, $Root, $ControlPlaneLog
 
-# Start WeChat iLink adapter
+# Start WeChat iLink
 $WxBotLog = Join-Path $LogDir "wxbot.log"
 Write-Host "[wxbot] starting..."
 $wxbotJob = Start-Job -Name "codex-wxbot" -ScriptBlock {
@@ -30,11 +40,11 @@ $wxbotJob = Start-Job -Name "codex-wxbot" -ScriptBlock {
 } -ArgumentList $Node, $Root, $WxBotLog
 
 Write-Host ""
-Write-Host "Both services started. Logs:"
+Write-Host "Logs:"
 Write-Host "  control-plane: $ControlPlaneLog"
 Write-Host "  wxbot        : $WxBotLog"
+Write-Host "Press Ctrl+C to stop."
 Write-Host ""
-Write-Host "Press Ctrl+C to stop both."
 
 try {
   while ($true) {

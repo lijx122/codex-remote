@@ -4,13 +4,11 @@ const state = {
   baseUrl: localStorage.getItem("codexControlPlaneUrl") || defaultBaseUrl(),
   conversationId: "",
   socket: null,
-  approval: null,
   pendingMessages: []
 };
 
 const els = {
   controlPlaneUrl: document.getElementById("controlPlaneUrl"),
-  saveUrl: document.getElementById("saveUrl"),
   refreshThreads: document.getElementById("refreshThreads"),
   threads: document.getElementById("threads"),
   currentTitle: document.getElementById("currentTitle"),
@@ -20,19 +18,17 @@ const els = {
   messageInput: document.getElementById("messageInput"),
   send: document.getElementById("send"),
   interrupt: document.getElementById("interrupt"),
-  approvalBox: document.getElementById("approvalBox"),
-  approvalText: document.getElementById("approvalText"),
-  approveYes: document.getElementById("approveYes"),
-  approveNo: document.getElementById("approveNo")
+  sidebarToggle: document.getElementById("sidebarToggle"),
+  sidebar: document.getElementById("sidebar"),
 };
 
-els.controlPlaneUrl.value = state.baseUrl;
-els.saveUrl.addEventListener("click", saveBaseUrl);
+els.controlPlaneUrl.value = state.baseUrl.replace(/^https?:\/\//, "");
+els.controlPlaneUrl.addEventListener("change", saveBaseUrl);
 els.refreshThreads.addEventListener("click", loadThreads);
 els.composer.addEventListener("submit", sendMessage);
 els.interrupt.addEventListener("click", interruptTurn);
-els.approveYes.addEventListener("click", () => approve(true));
-els.approveNo.addEventListener("click", () => approve(false));
+els.messageInput.addEventListener("input", autoResize);
+els.sidebarToggle.addEventListener("click", () => els.sidebar.classList.toggle("open"));
 
 loadThreads();
 
@@ -44,19 +40,17 @@ function defaultBaseUrl() {
 }
 
 function saveBaseUrl() {
-  state.baseUrl = els.controlPlaneUrl.value.replace(/\/$/, "");
+  const raw = els.controlPlaneUrl.value.trim();
+  state.baseUrl = raw.startsWith("http") ? raw.replace(/\/$/, "") : `http://${raw.replace(/\/$/, "")}`;
   localStorage.setItem("codexControlPlaneUrl", state.baseUrl);
-  setStatus("Control Plane 已保存");
+  setStatus("");
   loadThreads();
 }
 
 async function api(path, options = {}) {
   const response = await fetch(`${state.baseUrl}${path}`, {
     ...options,
-    headers: {
-      "content-type": "application/json",
-      ...(options.headers || {})
-    }
+    headers: { "content-type": "application/json", ...(options.headers || {}) }
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -65,42 +59,81 @@ async function api(path, options = {}) {
   return data;
 }
 
+/* ── Thread list ── */
+
 async function loadThreads() {
   try {
-    setStatus("加载会话...");
+    setStatus("");
     const threads = await api("/threads");
     els.threads.innerHTML = "";
-    for (const thread of threads) {
-      const button = document.createElement("button");
-      button.className = "thread";
-      button.textContent = thread.title || thread.conversationId;
-      button.addEventListener("click", () => openThread(thread));
-      els.threads.appendChild(button);
+    if (threads.length === 0) {
+      els.threads.innerHTML = '<div class="empty-state">暂无会话</div>';
+      return;
     }
-    setStatus(threads.length ? `会话 ${threads.length} 个` : "暂无会话，先在 Desktop 打开一个会话");
+    for (const thread of threads) {
+      els.threads.appendChild(buildThreadCard(thread));
+    }
   } catch (error) {
     setStatus(error.message);
   }
 }
 
+function buildThreadCard(thread) {
+  const card = document.createElement("button");
+  card.className = "thread-card";
+  card.addEventListener("click", () => openThread(thread));
+
+  const title = document.createElement("div");
+  title.className = "thread-title";
+  title.textContent = thread.title || thread.conversationId;
+
+  const meta = document.createElement("div");
+  meta.className = "thread-meta";
+
+  const dot = document.createElement("span");
+  dot.className = "thread-meta-dot";
+  if (thread.runtimeStatus === "running") dot.classList.add("running");
+
+  const info = document.createElement("span");
+  const parts = [];
+  if (thread.updatedAt) parts.push(relativeTime(thread.updatedAt));
+  if (thread.cwd) parts.push(baseName(thread.cwd));
+  info.textContent = parts.join("  ·  ") || "—";
+
+  meta.appendChild(dot);
+  meta.appendChild(info);
+  card.appendChild(title);
+  card.appendChild(meta);
+  return card;
+}
+
 async function openThread(thread) {
   state.conversationId = thread.conversationId;
   els.currentTitle.textContent = thread.title || thread.conversationId;
-  for (const item of els.threads.querySelectorAll(".thread")) {
-    item.classList.toggle("active", item.textContent === els.currentTitle.textContent);
+  els.messageInput.disabled = false;
+  els.send.disabled = false;
+  els.interrupt.disabled = false;
+
+  for (const card of els.threads.querySelectorAll(".thread-card")) {
+    const isActive = card.querySelector(".thread-title").textContent === els.currentTitle.textContent;
+    card.classList.toggle("active", isActive);
   }
   els.messages.innerHTML = "";
   state.pendingMessages = [];
   connectEvents();
   await loadHistory();
+
+  // Close sidebar on mobile after selection
+  if (window.innerWidth <= 720) els.sidebar.classList.remove("open");
 }
+
+/* ── History ── */
 
 async function loadHistory() {
   try {
-    setStatus("加载历史...");
+    setStatus("");
     const history = await api(`/history/${encodeURIComponent(state.conversationId)}`);
     renderHistory(history.state);
-    setStatus(`revision ${history.revision || ""}`);
   } catch (error) {
     setStatus(error.message);
   }
@@ -109,26 +142,29 @@ async function loadHistory() {
 function renderHistory(stateData) {
   els.messages.innerHTML = "";
   const turns = stateData && Array.isArray(stateData.turns) ? stateData.turns : [];
+  if (turns.length === 0) {
+    els.messages.innerHTML = '<div class="empty-state">暂无历史消息</div>';
+    return;
+  }
   for (const turn of turns) {
     for (const item of turn.items || []) {
       appendItem(item);
     }
   }
   prunePendingMessages(stateData);
-  for (const pending of state.pendingMessages) {
-    appendPendingMessage(pending);
-  }
+  for (const p of state.pendingMessages) appendPendingMessage(p);
   scrollBottom();
 }
 
 function appendItem(item) {
   if (item.type === "userMessage") {
-    const text = (item.content || []).map((part) => part.text || "").join("\n");
-    appendMessage("user", text);
+    appendMessage("user", (item.content || []).map(c => c.text || "").join("\n"));
   } else if (item.type === "agentMessage") {
     appendMessage("assistant", item.text || "");
   }
 }
+
+/* ── Send / Stop ── */
 
 async function sendMessage(event) {
   event.preventDefault();
@@ -137,16 +173,14 @@ async function sendMessage(event) {
   els.send.disabled = true;
   const pending = addPendingMessage(message);
   els.messageInput.value = "";
-  setStatus("发送中...");
+  els.messageInput.style.height = "auto";
+  setStatus("");
   try {
     const result = await api("/send", {
       method: "POST",
       body: JSON.stringify({ conversationId: state.conversationId, message })
     });
-    if (result.ok !== true) {
-      throw new Error(`发送失败: ${JSON.stringify(result)}`);
-    }
-    setStatus("已发送 ok=true");
+    if (result.ok !== true) throw new Error(result.error || "发送失败");
   } catch (error) {
     removePendingMessage(pending.id);
     setStatus(error.message);
@@ -168,56 +202,28 @@ async function interruptTurn() {
   }
 }
 
-async function approve(decision) {
-  if (!state.conversationId || !state.approval) return;
-  try {
-    await api("/approve", {
-      method: "POST",
-      body: JSON.stringify({
-        conversationId: state.conversationId,
-        approvalId: state.approval.approvalId,
-        decision
-      })
-    });
-    els.approvalBox.hidden = true;
-    state.approval = null;
-    setStatus(decision ? "已批准" : "已拒绝");
-  } catch (error) {
-    setStatus(error.message);
-  }
-}
+/* ── Events ── */
 
 function connectEvents() {
-  if (state.socket) {
-    state.socket.close();
-  }
+  if (state.socket) state.socket.close();
   const wsUrl = `${state.baseUrl.replace(/^http/, "ws")}/events?conversationId=${encodeURIComponent(state.conversationId)}`;
   state.socket = new WebSocket(wsUrl);
-  state.socket.onopen = () => setStatus("事件已连接");
-  state.socket.onerror = () => setStatus("事件连接错误");
   state.socket.onmessage = (event) => handleEvent(JSON.parse(event.data));
-  state.socket.onclose = () => setStatus("事件已断开");
+  state.socket.onclose = () => setStatus("");
+  state.socket.onerror = () => setStatus("");
 }
 
 function handleEvent(event) {
   if (event.type === "message") {
-    const payload = event.payload || {};
-    if (payload.role === "user" && hasPendingText(payload.text)) return;
-    if (payload.text) appendMessage(payload.role || "event", payload.text);
+    const p = event.payload || {};
+    if (p.role === "user" && hasPendingText(p.text)) return;
+    if (p.text) appendMessage(p.role || "event", p.text);
   } else if (event.type === "thread_state_changed") {
-    if (event.payload && event.payload.state) {
-      renderHistory(event.payload.state);
-    }
-  } else if (event.type === "turn_completed") {
-    appendMessage("event", "turn completed");
-  } else if (event.type === "approval_request") {
-    state.approval = event.payload || {};
-    els.approvalText.textContent = `Approval: ${state.approval.approvalId || ""}`;
-    els.approvalBox.hidden = false;
-  } else if (event.type === "error") {
-    setStatus((event.payload && event.payload.message) || "error");
+    if (event.payload && event.payload.state) renderHistory(event.payload.state);
   }
 }
+
+/* ── Messages ── */
 
 function appendMessage(role, text) {
   if (!text) return;
@@ -229,51 +235,64 @@ function appendMessage(role, text) {
 }
 
 function addPendingMessage(text) {
-  const pending = {
-    id: `pending-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    text
-  };
+  const pending = { id: `p-${Date.now()}-${Math.random().toString(16).slice(2)}`, text };
   state.pendingMessages.push(pending);
-  appendPendingMessage(pending);
-  return pending;
-}
-
-function appendPendingMessage(pending) {
-  if (!pending || !pending.text) return;
   const div = document.createElement("div");
   div.className = "msg user pending";
   div.dataset.pendingId = pending.id;
   div.textContent = pending.text;
   els.messages.appendChild(div);
   scrollBottom();
+  return pending;
 }
 
 function removePendingMessage(id) {
-  state.pendingMessages = state.pendingMessages.filter((message) => message.id !== id);
+  state.pendingMessages = state.pendingMessages.filter(m => m.id !== id);
   const el = els.messages.querySelector(`[data-pending-id="${id}"]`);
   if (el) el.remove();
 }
 
 function prunePendingMessages(stateData) {
-  state.pendingMessages = state.pendingMessages.filter((pending) => (
-    !historyHasUserText(stateData, pending.text)
-  ));
+  state.pendingMessages = state.pendingMessages.filter(p => !historyHasUserText(stateData, p.text));
 }
 
 function historyHasUserText(stateData, text) {
-  const turns = stateData && Array.isArray(stateData.turns) ? stateData.turns : [];
-  for (const turn of turns) {
+  for (const turn of (stateData && stateData.turns || [])) {
     for (const item of turn.items || []) {
       if (item.type !== "userMessage") continue;
-      const itemText = (item.content || []).map((part) => part.text || "").join("\n");
-      if (itemText === text) return true;
+      if ((item.content || []).map(c => c.text || "").join("\n") === text) return true;
     }
   }
   return false;
 }
 
 function hasPendingText(text) {
-  return Boolean(text && state.pendingMessages.some((pending) => pending.text === text));
+  return state.pendingMessages.some(p => p.text === text);
+}
+
+/* ── Helpers ── */
+
+function relativeTime(value) {
+  const ts = typeof value === "number" ? value : Date.parse(value);
+  if (!Number.isFinite(ts)) return "";
+  const diff = Math.max(0, Date.now() - ts);
+  if (diff < 60e3) return "刚刚";
+  if (diff < 3600e3) return `${Math.floor(diff / 60e3)} 分钟前`;
+  if (diff < 86400e3) return `${Math.floor(diff / 3600e3)} 小时前`;
+  if (diff < 172800e3) return "昨天";
+  return `${Math.floor(diff / 86400e3)} 天前`;
+}
+
+function baseName(p) {
+  const s = String(p || "").replace(/[\\/]+$/, "");
+  const i = Math.max(s.lastIndexOf("\\"), s.lastIndexOf("/"));
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+function autoResize() {
+  const el = els.messageInput;
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 120) + "px";
 }
 
 function setStatus(text) {
@@ -281,5 +300,7 @@ function setStatus(text) {
 }
 
 function scrollBottom() {
-  els.messages.scrollTop = els.messages.scrollHeight;
+  requestAnimationFrame(() => {
+    els.messages.scrollTop = els.messages.scrollHeight;
+  });
 }
