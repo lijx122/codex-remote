@@ -102,7 +102,40 @@ function textFromIlinkMessage(message) {
   return block && block.text_item && block.text_item.text ? block.text_item.text : "";
 }
 
+function extractMediaItems(message) {
+  // Returns array of {type, desc} for non-text items (images, files, voice, etc.)
+  if (!message || !Array.isArray(message.item_list)) return [];
+  const items = [];
+  for (const item of message.item_list) {
+    if (item.type === 2 && item.img_item) {
+      items.push({
+        type: "image",
+        desc: `[图片]`,
+        url: item.img_item.cdnurl || "",
+        aesKey: item.img_item.aes_key || ""
+      });
+    } else if (item.type === 3 && item.file_item) {
+      items.push({
+        type: "file",
+        desc: `[文件: ${item.file_item.file_name || "unknown"}]`,
+        url: item.file_item.cdnurl || "",
+        aesKey: item.file_item.aes_key || "",
+        fileName: item.file_item.file_name || "unknown"
+      });
+    } else if (item.type === 4 && item.voice_item) {
+      items.push({
+        type: "voice",
+        desc: `[语音]`,
+        url: item.voice_item.cdnurl || "",
+        aesKey: item.voice_item.aes_key || ""
+      });
+    }
+  }
+  return items;
+}
+
 module.exports = {
   ILinkClient,
-  textFromIlinkMessage
+  textFromIlinkMessage,
+  extractMediaItems
 };

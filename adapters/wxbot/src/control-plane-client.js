@@ -1,5 +1,12 @@
 "use strict";
 
+let WebSocketImpl;
+try {
+  WebSocketImpl = require("ws");
+} catch {
+  // Browser fallback
+}
+
 class ControlPlaneClient {
   constructor(options = {}) {
     this.baseUrl = (options.baseUrl || "http://127.0.0.1:8787").replace(/\/$/, "");
@@ -11,98 +18,55 @@ class ControlPlaneClient {
   }
 
   async loadHistory(conversationId) {
-    return this.request(`/threads/${encodeURIComponent(conversationId)}`);
+    return this.request(`/history/${encodeURIComponent(conversationId)}`);
   }
 
   async send(conversationId, message) {
-    return this.request(`/threads/${encodeURIComponent(conversationId)}/message`, {
+    return this.request("/send", {
       method: "POST",
-      body: { text: message }
+      body: { conversationId, message }
     });
   }
 
   async interrupt(conversationId) {
-    return this.request(`/threads/${encodeURIComponent(conversationId)}/stop`, {
+    return this.request("/interrupt", {
       method: "POST",
-      body: {}
+      body: { conversationId }
     });
   }
 
   async approve(conversationId, approvalId, decision) {
-    return this.request(`/approval/${encodeURIComponent(approvalId)}`, {
+    return this.request("/approve", {
       method: "POST",
-      body: { decision }
+      body: { conversationId, approvalId, decision }
     });
   }
 
   connectEvents(conversationId, handlers = {}) {
-    const wsUrl = `${this.baseUrl}/threads/${encodeURIComponent(conversationId)}/events`;
-
-    // Instead of WebSocket (which daily_server doesn't support), we use EventSource (SSE)
-    // Wait, Node.js doesn't have EventSource built-in.
-    // Let's implement a simple fetch-based SSE reader for the daily_server
-
-    let active = true;
-    const controller = new AbortController();
-
-    const start = async () => {
-      if (handlers.open) handlers.open();
+    const WS = WebSocketImpl || (typeof WebSocket !== "undefined" ? WebSocket : null);
+    if (!WS) {
+      throw new Error("WebSocket not available — install 'ws' for Node.js");
+    }
+    const wsUrl = `${this.baseUrl.replace(/^http/, "ws")}/events?conversationId=${encodeURIComponent(conversationId)}`;
+    const socket = new WS(wsUrl);
+    socket.addEventListener("message", (event) => {
       try {
-        const response = await fetch(wsUrl, {
-          method: "GET",
-          headers: {
-            "Accept": "text/event-stream"
-          },
-          signal: controller.signal
-        });
-
-        if (!response.ok) {
-          throw new Error(`SSE connect failed: ${response.status}`);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-
-        while (active) {
-          const { value, done } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split(/\r?\n\r?\n/);
-          buffer = lines.pop() || "";
-
-          for (const chunk of lines) {
-            if (!chunk.trim()) continue;
-            if (chunk.startsWith("data: ")) {
-              try {
-                const data = JSON.parse(chunk.slice(6));
-                if (handlers.message) handlers.message({
-                   type: extractTypeFromSse(data),
-                   conversationId: data.params?.threadId || conversationId,
-                   payload: data
-                });
-              } catch (e) {
-                // ignore parse error
-              }
-            }
-          }
-        }
+        const data = JSON.parse(event.data);
+        if (handlers.message) handlers.message(data);
       } catch (error) {
-        if (active && handlers.error) handlers.error(error);
-      } finally {
-        if (active && handlers.close) handlers.close();
+        if (handlers.error) handlers.error(error);
       }
-    };
-
-    start();
-
-    return {
-      close() {
-        active = false;
-        controller.abort();
-      }
-    };
+    });
+    socket.addEventListener("error", (event) => {
+      if (handlers.error) handlers.error(event.error || new Error("WebSocket error"));
+    });
+    socket.addEventListener("close", () => {
+      if (handlers.close) handlers.close();
+    });
+    socket.addEventListener("open", () => {
+      if (handlers.open) handlers.open();
+    });
+    return socket;
   }
 
   async request(path, options = {}) {
@@ -133,15 +97,6 @@ class ControlPlaneClient {
       clearTimeout(timer);
     }
   }
-}
-
-function extractTypeFromSse(data) {
-  const method = data.method || "";
-  if (method === "thread-stream-state-changed") return "thread_state_changed";
-  if (method === "turn/completed") return "turn_completed";
-  if (method === "commandExecution/requestApproval" || method === "item/commandExecution/requestApproval" || method.includes("requestApproval")) return "approval_request";
-  if (method === "agent/message/delta" || method === "item/started" || method === "item/completed") return "message";
-  return method;
 }
 
 function isConnectionError(error) {

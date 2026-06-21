@@ -71,13 +71,15 @@ class WxBotAdapter {
 
   async commandSwitch(prefix) {
     if (!prefix) {
-      await this.reply("用法：/q <conversationId前缀>");
+      await this.reply("用法：/q <序号> 或 /q <id前缀>");
       return;
     }
-    const threads = await this.client.listThreads();
-    const thread = findThreadByPrefix(threads, prefix);
+    const allThreads = await this.client.listThreads();
+    // /q 3 uses the same 20-item view as /ls; /q <uuid-prefix> searches full list
+    const searchPool = /^\d+$/.test(prefix.trim()) ? allThreads.slice(0, this.maxThreads) : allThreads;
+    const thread = findThreadByPrefix(searchPool, prefix);
     if (!thread) {
-      await this.reply("会话不存在，请使用 /list 查看");
+      await this.reply("会话不存在，请使用 /ls 查看");
       return;
     }
 

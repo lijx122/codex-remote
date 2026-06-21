@@ -21,11 +21,10 @@ const path = require("node:path");
 })();
 
 const { createWxBotAdapter } = require("../src");
-const { ILinkClient, textFromIlinkMessage } = require("../src/ilink-client");
-const { FollowerCoreClient } = require("../src/follower-client");
+const { ILinkClient, textFromIlinkMessage, extractMediaItems } = require("../src/ilink-client");
 
 const ilinkClient = new ILinkClient();
-const followerClient = new FollowerCoreClient();
+const controlPlaneUrl = process.env.CODEX_CONTROL_PLANE_URL || "http://127.0.0.1:8787";
 
 const RUNTIME_DIR = path.resolve(__dirname, "..", ".runtime");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "ilink-bot-token.json");
@@ -61,7 +60,7 @@ function saveTokenToFile(token) {
 }
 
 const adapter = createWxBotAdapter({
-  client: followerClient,
+  controlPlaneUrl,
   sendText: async (text) => {
     if (!botToken) {
       process.stdout.write(`[WX OUT skipped: not logged in]\n${text}\n`);
@@ -99,7 +98,7 @@ process.on("SIGINT", () => {
 });
 
 async function main() {
-  process.stdout.write("Codex WeChat iLink Adapter (direct IPC)\n");
+  process.stdout.write("Codex WeChat iLink Adapter\n");
 
   while (!stopping) {
     if (!botToken) {
@@ -144,13 +143,22 @@ async function main() {
 
         for (const message of result.msgs || []) {
           const text = textFromIlinkMessage(message);
-          if (!text) continue;
+          const media = extractMediaItems(message);
           currentTarget = {
             toUserId: message.from_user_id,
             contextToken: message.context_token || ""
           };
-          process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "in", from: shortId(message.from_user_id), text })}\n`);
-          await adapter.handleText(text);
+
+          if (text) {
+            process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "in", from: shortId(message.from_user_id), text })}\n`);
+            await adapter.handleText(text);
+          } else if (media.length > 0) {
+            const desc = media.map(m => m.desc).join(", ");
+            process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "in", from: shortId(message.from_user_id), media: desc })}\n`);
+            // Forward media as text description to Desktop
+            const label = `[收到 ${desc}]`;
+            await adapter.handleText(label);
+          }
         }
       } catch (error) {
         if (error && error.name === "TimeoutError") continue;

@@ -39,12 +39,36 @@ class CodexFollowerCore {
     for (const thread of this.readSessionIndex()) {
       threads.set(thread.id, thread);
     }
+    // Merge runtime broadcasts (catches threads not yet in session_index.jsonl)
     for (const thread of this.threads.values()) {
       threads.set(thread.id, { ...(threads.get(thread.id) || {}), ...thread });
+    }
+    // Scan filesystem for new rollout files not in index or broadcasts
+    for (const [id, cwd] of this.scanSessionFiles()) {
+      if (!threads.has(id)) {
+        threads.set(id, { id, title: null, updatedAt: null, sessionId: null, cwd, runtimeStatus: null, raw: {} });
+      }
     }
     return Array.from(threads.values())
       .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")))
       .map((thread) => ({ ...thread }));
+  }
+
+  scanSessionFiles() {
+    // Scans sessions/ dir for rollout JSONL files, extracts thread ID + cwd from filename.
+    // Catches Desktop threads created but not yet flushed to session_index.jsonl.
+    const result = new Map();
+    const sessionsRoot = path.join(this.codexHome, "sessions");
+    const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
+    try {
+      for (const file of walkJsonlFiles(sessionsRoot)) {
+        const m = file.match(uuidRe);
+        if (m) result.set(m[0], null);
+      }
+    } catch {
+      // Directory might not exist or be inaccessible
+    }
+    return result;
   }
 
   readSessionIndex() {
@@ -62,6 +86,8 @@ class CodexFollowerCore {
       try {
         const item = JSON.parse(line);
         if (!item.id) continue;
+        // Skip archived threads (rollout only in archived_sessions)
+        if (this.isThreadArchived(item.id)) continue;
         threads.push({
           id: item.id,
           title: item.thread_name || item.title || null,
@@ -236,6 +262,17 @@ class CodexFollowerCore {
       if (found) return found;
     }
     return null;
+  }
+
+  isThreadArchived(conversationId) {
+    // Check if the rollout file is ONLY in archived_sessions (not in sessions)
+    const sessionsRoot = path.join(this.codexHome, "sessions");
+    const activePath = findFileByName(sessionsRoot, conversationId);
+    if (activePath) return false;
+
+    const archivedRoot = path.join(this.codexHome, "archived_sessions");
+    const archivedPath = findFileByName(archivedRoot, conversationId);
+    return !!archivedPath;
   }
 
   async sendMessage(conversationId, text) {
@@ -495,6 +532,25 @@ function findFileByName(root, text) {
     }
   }
   return null;
+}
+
+function walkJsonlFiles(root) {
+  const files = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return files;
+  }
+  for (const entry of entries) {
+    const fullPath = path.join(root, entry.name);
+    if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      files.push(entry.name);
+    } else if (entry.isDirectory()) {
+      files.push(...walkJsonlFiles(fullPath));
+    }
+  }
+  return files;
 }
 
 module.exports = {
