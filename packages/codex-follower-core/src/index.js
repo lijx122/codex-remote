@@ -3,6 +3,13 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+
+let Database;
+try {
+  Database = require("better-sqlite3");
+} catch {
+  // Optional: state_5.sqlite filtering is skipped if better-sqlite3 is not installed
+}
 const { IpcTransport } = require("./ipc-transport");
 const { CodexFollowerEventBus } = require("./event-bus");
 
@@ -35,18 +42,24 @@ class CodexFollowerCore {
   }
 
   listThreads() {
+    // Build the set of active thread IDs: only those with a rollout file in sessions/ (not archived_sessions)
+    const activeIds = this.getActiveThreadIds();
+
     const threads = new Map();
+    // session_index provides titles and timestamps, but filter to active only
     for (const thread of this.readSessionIndex()) {
-      threads.set(thread.id, thread);
+      if (activeIds.has(thread.id)) {
+        threads.set(thread.id, thread);
+      }
     }
-    // Merge runtime broadcasts (catches threads not yet in session_index.jsonl)
+    // Merge runtime broadcasts (may include threads not yet in index)
     for (const thread of this.threads.values()) {
       threads.set(thread.id, { ...(threads.get(thread.id) || {}), ...thread });
     }
-    // Scan filesystem for new rollout files not in index or broadcasts
-    for (const [id, cwd] of this.scanSessionFiles()) {
+    // Add filesystem-only threads (rollout exists but not in index yet)
+    for (const id of activeIds) {
       if (!threads.has(id)) {
-        threads.set(id, { id, title: null, updatedAt: null, sessionId: null, cwd, runtimeStatus: null, raw: {} });
+        threads.set(id, { id, title: null, updatedAt: null, sessionId: null, cwd: this.getThreadCwd(id), runtimeStatus: null, raw: {} });
       }
     }
     return Array.from(threads.values())
@@ -54,21 +67,40 @@ class CodexFollowerCore {
       .map((thread) => ({ ...thread }));
   }
 
-  scanSessionFiles() {
-    // Scans sessions/ dir for rollout JSONL files, extracts thread ID + cwd from filename.
-    // Catches Desktop threads created but not yet flushed to session_index.jsonl.
-    const result = new Map();
+  getActiveThreadIds() {
+    // Only threads with a rollout file in sessions/ (not archived_sessions) are active
+    // Also excludes threads marked archived=1 in state_5.sqlite
+    const ids = new Set();
     const sessionsRoot = path.join(this.codexHome, "sessions");
     const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
     try {
       for (const file of walkJsonlFiles(sessionsRoot)) {
         const m = file.match(uuidRe);
-        if (m) result.set(m[0], null);
+        if (m) ids.add(m[0]);
       }
     } catch {
-      // Directory might not exist or be inaccessible
+      // Directory might not exist
     }
-    return result;
+    // Subtract threads archived in SQLite
+    for (const id of this.getArchivedIdsFromDb()) {
+      ids.delete(id);
+    }
+    return ids;
+  }
+
+  getArchivedIdsFromDb() {
+    if (!Database) return new Set();
+    const dbPath = path.join(this.codexHome, "state_5.sqlite");
+    let db;
+    try {
+      db = new Database(dbPath, { readonly: true });
+      const rows = db.prepare("SELECT id FROM threads WHERE archived = 1").all();
+      return new Set(rows.map(r => r.id));
+    } catch {
+      return new Set();
+    } finally {
+      if (db) db.close();
+    }
   }
 
   readSessionIndex() {
@@ -86,8 +118,6 @@ class CodexFollowerCore {
       try {
         const item = JSON.parse(line);
         if (!item.id) continue;
-        // Skip archived threads (rollout only in archived_sessions)
-        if (this.isThreadArchived(item.id)) continue;
         threads.push({
           id: item.id,
           title: item.thread_name || item.title || null,
