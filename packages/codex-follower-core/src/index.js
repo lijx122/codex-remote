@@ -42,16 +42,21 @@ class CodexFollowerCore {
   }
 
   listThreads() {
-    // Hybrid: show all non-archived threads from session_index + state_5.sqlite,
-    // enriched with broadcast data from this.threads (runtime status, live title).
-    // Threads in this.threads are guaranteed sendable (Desktop has them loaded).
-    // Others are shown too but may need user to open in Desktop before sending.
+    // Base: session_index (authoritative for what exists on disk)
+    // Supplement: SQLite for threads not in index (e.g. recently created)
+    // Overlay: this.threads (Desktop broadcast, live state)
     const archivedIds = this.getArchivedIdsFromDb();
-    const indexEntries = this.readSessionIndex().filter(e => !archivedIds.has(e.id));
-
-    // Build merged map: index entries as base, broadcast data overrides
-    const merged = new Map();
+    const indexEntries = this.readSessionIndex();
+    const indexMap = new Map();
     for (const idx of indexEntries) {
+      indexMap.set(idx.id, idx);
+    }
+
+    const merged = new Map();
+
+    // Pass 1: index entries (non-archived)
+    for (const idx of indexEntries) {
+      if (archivedIds.has(idx.id)) continue;
       merged.set(idx.id, {
         id: idx.id,
         title: idx.title || idx.id,
@@ -64,7 +69,25 @@ class CodexFollowerCore {
       });
     }
 
-    // Overlay broadcast data (always more current)
+    // Pass 2: SQLite threads not in index (catch recently created / unindexed)
+    // Only include if rollout file exists in sessions/ (not archived_sessions/)
+    const activeIds = this.getActiveThreadIds();
+    for (const row of this.getNonArchivedThreadsFromDb()) {
+      if (merged.has(row.id)) continue;
+      if (!activeIds.has(row.id)) continue;
+      merged.set(row.id, {
+        id: row.id,
+        title: row.title || row.id,
+        updatedAt: null,
+        sessionId: null,
+        cwd: this.getThreadCwd(row.id),
+        runtimeStatus: null,
+        sendable: this.threads.has(row.id),
+        raw: {}
+      });
+    }
+
+    // Pass 3: overlay broadcast data (always more current)
     for (const thread of this.threads.values()) {
       const existing = merged.get(thread.id);
       merged.set(thread.id, {
@@ -120,6 +143,22 @@ class CodexFollowerCore {
     }
   }
 
+  getNonArchivedThreadsFromDb() {
+    if (!Database) return [];
+    const dbPath = path.join(this.codexHome, "state_5.sqlite");
+    let db;
+    try {
+      db = new Database(dbPath, { readonly: true });
+      return db
+        .prepare("SELECT id, title FROM threads WHERE archived = 0 OR archived IS NULL ORDER BY rowid DESC")
+        .all();
+    } catch {
+      return [];
+    } finally {
+      if (db) db.close();
+    }
+  }
+
   readSessionIndex() {
     const indexPath = path.join(this.codexHome, "session_index.jsonl");
     let raw;
@@ -129,18 +168,23 @@ class CodexFollowerCore {
       return [];
     }
 
+    const seen = new Set();
     const threads = [];
-    for (const line of raw.split(/\r?\n/)) {
+    // Read from newest to oldest (file is append-only), so first encounter = latest
+    const lines = raw.split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
       if (!line.trim()) continue;
       try {
         const item = JSON.parse(line);
-        if (!item.id) continue;
+        if (!item.id || seen.has(item.id)) continue;
+        seen.add(item.id);
         threads.push({
           id: item.id,
           title: item.thread_name || item.title || null,
           updatedAt: item.updated_at || item.updatedAt || null,
           sessionId: item.session_id || item.sessionId || null,
-          cwd: item.cwd || this.getThreadCwd(item.id),
+          cwd: item.cwd || null,
           runtimeStatus: null,
           raw: item
         });

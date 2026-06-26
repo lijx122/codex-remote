@@ -78,8 +78,7 @@ class WxBotAdapter {
       return;
     }
     const allThreads = await this.client.listThreads();
-    const searchPool = /^\d+$/.test(prefix.trim()) ? allThreads.slice(0, this.maxThreads) : allThreads;
-    const thread = findThreadByPrefix(searchPool, prefix);
+    const thread = findThreadByPrefix(allThreads, prefix);
     if (!thread) {
       await this.reply("会话不存在，请使用 /ls 查看");
       return;
@@ -104,11 +103,14 @@ class WxBotAdapter {
     }
 
     this.connectEvents();
+    const rawTitle = (this.currentThread && this.currentThread.title) || this.currentConversationId;
+    const short = String(rawTitle).replace(/\r?\n/g, " ");
+    const display = short.length > 40 ? short.slice(0, 40) + "…" : short;
     await this.reply([
       "当前会话：",
       this.currentConversationId.slice(0, 20) + "...",
       "",
-      "标题：" + ((this.currentThread && this.currentThread.title) || this.currentConversationId)
+      "标题：" + display
     ].join("\n"));
   }
 
@@ -117,12 +119,15 @@ class WxBotAdapter {
       await this.reply("请先使用 /q 或 /new");
       return;
     }
+    const rawTitle = (this.currentThread && this.currentThread.title) || this.currentConversationId;
+    const short = String(rawTitle).replace(/\r?\n/g, " ");
+    const display = short.length > 40 ? short.slice(0, 40) + "…" : short;
     await this.reply([
       "当前会话：",
       this.currentConversationId,
       "",
       "标题：",
-      (this.currentThread && this.currentThread.title) || this.currentConversationId,
+      display,
       "",
       "最后活动：",
       formatLastActive(this.currentThread, this.now())
@@ -163,11 +168,14 @@ class WxBotAdapter {
   async sendUserMessage(message) {
     if (!await this.requireConversation()) return;
     await this.client.send(this.currentConversationId, message);
+    const rawTitle = (this.currentThread && this.currentThread.title) || this.currentConversationId;
+    const short = String(rawTitle).replace(/\r?\n/g, " ");
+    const display = short.length > 40 ? short.slice(0, 40) + "…" : short;
     await this.reply([
       "✓ 已提交",
       "",
       "当前会话：",
-      (this.currentThread && this.currentThread.title) || this.currentConversationId,
+      display,
       "",
       "状态：",
       "运行中..."

@@ -33,11 +33,14 @@ function relativeTime(value, now = Date.now()) {
 }
 
 function formatThread(thread, index, now = Date.now()) {
-  const title = thread.title || thread.conversationId || "未命名会话";
+  const rawTitle = thread.title || thread.conversationId || "未命名会话";
+  // Strip newlines, truncate — SQLite stores full first message as title
+  const title = rawTitle.replace(/\r?\n/g, " ");
+  const display = title.length > 40 ? title.slice(0, 40) + "…" : title;
   const id = thread.conversationId || thread.id || "";
   const tag = thread.sendable ? "●" : "○";
   return [
-    `${index + 1}. ${tag} ${title}`,
+    `${index + 1}. ${tag} ${display}`,
     `   ${id.slice(0, 8)}`,
     `   ${relativeTime(thread.updatedAt, now)}`
   ].join("\n");
