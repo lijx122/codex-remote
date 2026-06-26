@@ -44,7 +44,9 @@ function createControlPlaneServer(options = {}) {
     if (connected) return;
     if (!connecting) {
       connecting = core.connect()
-        .then(() => {
+        .then(async () => {
+          // Wait 500ms for Desktop to broadcast currently loaded threads
+          await new Promise((r) => setTimeout(r, 500));
           connected = true;
         })
         .finally(() => {
@@ -136,7 +138,8 @@ function createControlPlaneServer(options = {}) {
           title: thread.title || thread.id,
           updatedAt: thread.updatedAt || null,
           cwd: thread.cwd || null,
-          runtimeStatus: thread.runtimeStatus || null
+          runtimeStatus: thread.runtimeStatus || null,
+          sendable: thread.sendable || false
         })));
         return;
       }
@@ -160,12 +163,48 @@ function createControlPlaneServer(options = {}) {
           conversationId: body.conversationId,
           messageLength: typeof body.message === "string" ? body.message.length : 0
         });
-        const result = await core.sendMessage(body.conversationId, body.message);
-        logCommand("send.result", {
-          conversationId: body.conversationId,
-          ok: result.ok
-        });
-        await sendJson(res, result.ok ? 200 : 502, { ok: result.ok, raw: result.raw });
+        try {
+          const result = await core.sendMessage(body.conversationId, body.message);
+          logCommand("send.result", {
+            conversationId: body.conversationId,
+            ok: result.ok
+          });
+          await sendJson(res, 200, { ok: true, raw: result.raw });
+        } catch (error) {
+          const errMsg = String(error.message || "");
+          logCommand("send.error", {
+            conversationId: body.conversationId,
+            error: errMsg
+          });
+
+          // Auto-warm: trigger deep link, wait for broadcast, then retry once
+          if (/no-client-found|not found/i.test(errMsg)) {
+            logCommand("warm.before-retry", { conversationId: body.conversationId });
+            const warmResult = await core.warmThread(body.conversationId);
+            logCommand("warm.before-retry.result", { conversationId: body.conversationId, ...warmResult });
+            if (warmResult.ok) {
+              // Give Desktop a moment to fully load the thread
+              await new Promise((r) => setTimeout(r, 1000));
+              try {
+                const retryResult = await core.sendMessage(body.conversationId, body.message);
+                logCommand("send.retry.result", { conversationId: body.conversationId, ok: retryResult.ok });
+                await sendJson(res, 200, { ok: true, raw: retryResult.raw });
+                return;
+              } catch (retryError) {
+                logCommand("send.retry.error", {
+                  conversationId: body.conversationId,
+                  error: String(retryError.message || "")
+                });
+              }
+            }
+          }
+
+          await sendJson(res, 409, {
+            ok: false,
+            error: "会话未在 Desktop 中打开，请先在 Desktop 中打开此会话",
+            detail: errMsg
+          });
+        }
         return;
       }
 
@@ -176,6 +215,16 @@ function createControlPlaneServer(options = {}) {
         const result = await core.interrupt(body.conversationId);
         logCommand("interrupt.result", { conversationId: body.conversationId, ok: result.ok });
         await sendJson(res, 200, { ok: result.ok });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/warm") {
+        await ensureConnected();
+        const body = await readJson(req);
+        logCommand("warm", { conversationId: body.conversationId });
+        const result = await core.warmThread(body.conversationId);
+        logCommand("warm.result", { conversationId: body.conversationId, ...result });
+        await sendJson(res, 200, result);
         return;
       }
 

@@ -35,6 +35,13 @@ class ControlPlaneClient {
     });
   }
 
+  async warm(conversationId) {
+    return this.request("/warm", {
+      method: "POST",
+      body: { conversationId }
+    });
+  }
+
   async approve(conversationId, approvalId, decision) {
     return this.request("/approve", {
       method: "POST",

@@ -1,9 +1,19 @@
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Node = "node"
 $LogDir = Join-Path $Root "reports"
 New-Item -ItemType Directory -Force $LogDir | Out-Null
+
+# Resolve node via fnm if available
+$nodePath = "node"
+try {
+  $fnmOut = fnm env 2>$null
+  if ($fnmOut) {
+    $fnmOut | ForEach-Object { Invoke-Expression $_ }
+    $resolved = (Get-Command node -ErrorAction Stop).Source
+    if ($resolved) { $nodePath = $resolved }
+  }
+} catch {}
 
 # Read .env for display
 $envPath = Join-Path $Root ".env"
@@ -16,51 +26,32 @@ if (Test-Path $envPath) {
   }
 }
 
-Write-Host "=== Codex Remote ==="
-Write-Host "Web UI : http://${hostAddr}:$port"
-Write-Host "WeChat : scan QR if needed"
-Write-Host ""
+# Kill any leftover node processes from previous runs on our scripts
+Get-Process -Name node -ErrorAction SilentlyContinue | Where-Object {
+  try { $_.CommandLine -match "codex-control-plane|ilink\.js" } catch { $false }
+} | Stop-Process -Force -Confirm:$false -ErrorAction SilentlyContinue
 
-# Start codex-control-plane
 $ControlPlaneLog = Join-Path $LogDir "control-plane.log"
-Write-Host "[control-plane] starting..."
-$controlPlaneJob = Start-Job -Name "codex-control-plane" -ScriptBlock {
-  param($node, $root, $log)
-  Set-Location $root
-  & $node tools\codex-control-plane.js *>> $log
-} -ArgumentList $Node, $Root, $ControlPlaneLog
-
-# Start WeChat iLink
 $WxBotLog = Join-Path $LogDir "wxbot.log"
-Write-Host "[wxbot] starting..."
-$wxbotJob = Start-Job -Name "codex-wxbot" -ScriptBlock {
-  param($node, $root, $log)
-  Set-Location $root
-  & $node adapters\wxbot\bin\ilink.js *>> $log
-} -ArgumentList $Node, $Root, $WxBotLog
 
-Write-Host ""
-Write-Host "Logs:"
-Write-Host "  control-plane: $ControlPlaneLog"
-Write-Host "  wxbot        : $WxBotLog"
-Write-Host "Press Ctrl+C to stop."
-Write-Host ""
+# Start as background processes with proper UTF-8 output
+$cpProc = Start-Process -FilePath $nodePath `
+  -ArgumentList "tools\codex-control-plane.js" `
+  -WorkingDirectory $Root `
+  -WindowStyle Hidden `
+  -RedirectStandardOutput $ControlPlaneLog `
+  -RedirectStandardError (Join-Path $LogDir "control-plane.err") `
+  -PassThru
 
-try {
-  while ($true) {
-    Start-Sleep -Seconds 5
-    if ($controlPlaneJob.State -ne 'Running') {
-      Write-Host "[control-plane] stopped unexpectedly"
-      Receive-Job $controlPlaneJob
-      break
-    }
-    if ($wxbotJob.State -ne 'Running') {
-      Write-Host "[wxbot] stopped unexpectedly"
-      Receive-Job $wxbotJob
-      break
-    }
-  }
-} finally {
-  Stop-Job -Name "codex-control-plane", "codex-wxbot" -ErrorAction SilentlyContinue
-  Remove-Job -Name "codex-control-plane", "codex-wxbot" -ErrorAction SilentlyContinue
-}
+$wxProc = Start-Process -FilePath $nodePath `
+  -ArgumentList "adapters\wxbot\bin\ilink.js" `
+  -WorkingDirectory $Root `
+  -WindowStyle Hidden `
+  -RedirectStandardOutput $WxBotLog `
+  -RedirectStandardError (Join-Path $LogDir "wxbot.err") `
+  -PassThru
+
+# Write PID file for cleanup
+$pidFile = Join-Path $LogDir "pids.json"
+@{ controlPlane = $cpProc.Id; wxbot = $wxProc.Id; startedAt = (Get-Date -Format o) } |
+  ConvertTo-Json | Out-File $pidFile -Encoding utf8

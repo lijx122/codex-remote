@@ -49,7 +49,7 @@ class WxBotAdapter {
     const [command, ...rest] = input.split(/\s+/);
     const arg = rest.join(" ").trim();
 
-    if (command === "/ls" || command === "/list") return this.commandList();
+    if (command === "/ls" || command === "/list") return this.commandList(arg);
     if (command === "/q") return this.commandSwitch(arg);
     if (command === "/where") return this.commandWhere();
     if (command === "/stop") return this.commandStop();
@@ -59,14 +59,17 @@ class WxBotAdapter {
     await this.reply("未知命令，发送 /help 查看可用命令");
   }
 
-  async commandList() {
+  async commandList(arg) {
     const threads = await this.client.listThreads();
-    const recent = threads.slice(0, this.maxThreads);
+    const limit = arg === "all" ? threads.length : (parseInt(arg, 10) || this.maxThreads);
+    const recent = threads.slice(0, limit);
     if (recent.length === 0) {
       await this.reply("暂无会话，请先在 Desktop 打开或创建一个会话");
       return;
     }
-    await this.reply(recent.map((thread, index) => formatThread(thread, index, this.now())).join("\n\n"));
+    const lines = recent.map((thread, index) => formatThread(thread, index, this.now())).join("\n\n");
+    const sendableCount = recent.filter(t => t.sendable).length;
+    await this.reply(`${lines}\n\n● 已就绪(${sendableCount})  ○ 切换时自动打开`);
   }
 
   async commandSwitch(prefix) {
@@ -75,7 +78,6 @@ class WxBotAdapter {
       return;
     }
     const allThreads = await this.client.listThreads();
-    // /q 3 uses the same 20-item view as /ls; /q <uuid-prefix> searches full list
     const searchPool = /^\d+$/.test(prefix.trim()) ? allThreads.slice(0, this.maxThreads) : allThreads;
     const thread = findThreadByPrefix(searchPool, prefix);
     if (!thread) {
@@ -85,13 +87,28 @@ class WxBotAdapter {
 
     this.currentConversationId = thread.conversationId || thread.id;
     this.currentThread = thread;
+
+    // Auto-warm if not loaded in Desktop
+    if (!thread.sendable) {
+      await this.reply("正在打开会话，请稍候...");
+      const warmResult = await this.client.warm(this.currentConversationId);
+      if (!warmResult.ok) {
+        await this.reply("会话打开失败，请先在 Desktop 中手动打开此会话");
+        return;
+      }
+      // Refresh thread list to get updated sendable status
+      const refreshed = await this.client.listThreads();
+      this.currentThread = refreshed.find(
+        (t) => (t.conversationId || t.id) === this.currentConversationId
+      ) || thread;
+    }
+
     this.connectEvents();
     await this.reply([
       "当前会话：",
-      this.currentConversationId,
+      this.currentConversationId.slice(0, 20) + "...",
       "",
-      "标题：",
-      thread.title || this.currentConversationId
+      "标题：" + ((this.currentThread && this.currentThread.title) || this.currentConversationId)
     ].join("\n"));
   }
 
@@ -131,7 +148,7 @@ class WxBotAdapter {
 
   async commandHelp() {
     await this.reply([
-      "/ls       查看最近会话",
+      "/ls [数量] 查看最近会话（默认20，/ls all 查看全部）",
       "/q <序号>  切换会话",
       "/where    查看当前会话",
       "/history  查看最近消息",
@@ -229,7 +246,7 @@ class WxBotAdapter {
   toUserError(error) {
     const message = errorMessage(error);
     if (/Desktop 当前离线|fetch failed|ECONNREFUSED/i.test(message)) return "Desktop 当前离线";
-    if (/no-client-found|not found/i.test(message)) return "会话不存在，请使用 /list 查看";
+    if (/no-client-found|not found|未在 Desktop 中打开/i.test(message)) return "会话未在 Desktop 中打开\n请先在 Desktop 中打开此会话，再用 /q 切换";
     return `执行失败\n\n错误：\n${message}`;
   }
 }

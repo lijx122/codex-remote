@@ -42,29 +42,46 @@ class CodexFollowerCore {
   }
 
   listThreads() {
-    // Build the set of active thread IDs: only those with a rollout file in sessions/ (not archived_sessions)
-    const activeIds = this.getActiveThreadIds();
+    // Hybrid: show all non-archived threads from session_index + state_5.sqlite,
+    // enriched with broadcast data from this.threads (runtime status, live title).
+    // Threads in this.threads are guaranteed sendable (Desktop has them loaded).
+    // Others are shown too but may need user to open in Desktop before sending.
+    const archivedIds = this.getArchivedIdsFromDb();
+    const indexEntries = this.readSessionIndex().filter(e => !archivedIds.has(e.id));
 
-    const threads = new Map();
-    // session_index provides titles and timestamps, but filter to active only
-    for (const thread of this.readSessionIndex()) {
-      if (activeIds.has(thread.id)) {
-        threads.set(thread.id, thread);
-      }
+    // Build merged map: index entries as base, broadcast data overrides
+    const merged = new Map();
+    for (const idx of indexEntries) {
+      merged.set(idx.id, {
+        id: idx.id,
+        title: idx.title || idx.id,
+        updatedAt: idx.updatedAt || null,
+        sessionId: idx.sessionId || null,
+        cwd: idx.cwd || this.getThreadCwd(idx.id),
+        runtimeStatus: null,
+        sendable: this.threads.has(idx.id),
+        raw: idx.raw || {}
+      });
     }
-    // Merge runtime broadcasts (may include threads not yet in index)
+
+    // Overlay broadcast data (always more current)
     for (const thread of this.threads.values()) {
-      threads.set(thread.id, { ...(threads.get(thread.id) || {}), ...thread });
+      const existing = merged.get(thread.id);
+      merged.set(thread.id, {
+        id: thread.id,
+        title: thread.title || (existing && existing.title) || thread.id,
+        updatedAt: thread.updatedAt || (existing && existing.updatedAt) || null,
+        sessionId: thread.sessionId || (existing && existing.sessionId) || null,
+        cwd: thread.cwd || (existing && existing.cwd) || this.getThreadCwd(thread.id),
+        runtimeStatus: thread.runtimeStatus || null,
+        sendable: true,
+        raw: thread.raw || {}
+      });
     }
-    // Add filesystem-only threads (rollout exists but not in index yet)
-    for (const id of activeIds) {
-      if (!threads.has(id)) {
-        threads.set(id, { id, title: null, updatedAt: null, sessionId: null, cwd: this.getThreadCwd(id), runtimeStatus: null, raw: {} });
-      }
-    }
-    return Array.from(threads.values())
-      .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")))
-      .map((thread) => ({ ...thread }));
+
+    return [...merged.values()].sort((a, b) =>
+      String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""))
+    );
   }
 
   getActiveThreadIds() {
@@ -303,6 +320,49 @@ class CodexFollowerCore {
     const archivedRoot = path.join(this.codexHome, "archived_sessions");
     const archivedPath = findFileByName(archivedRoot, conversationId);
     return !!archivedPath;
+  }
+
+  async warmThread(conversationId) {
+    this.assertConversationId(conversationId);
+
+    // Already loaded — nothing to do
+    if (this.threads.has(conversationId)) return { ok: true, alreadyLoaded: true };
+
+    return new Promise((resolve) => {
+      const timeoutMs = 15000;
+      const timer = setTimeout(() => {
+        this.transport.off("broadcast", onBroadcast);
+        resolve({ ok: false, timeout: true });
+      }, timeoutMs);
+
+      const onBroadcast = (message) => {
+        if (message.method !== "thread-stream-state-changed") return;
+        const params = message.params || {};
+        if (params.conversationId === conversationId) {
+          clearTimeout(timer);
+          this.transport.off("broadcast", onBroadcast);
+          // Give a small grace period for the handler to update this.threads
+          setImmediate(() => resolve({ ok: true, alreadyLoaded: false }));
+        }
+      };
+
+      this.transport.on("broadcast", onBroadcast);
+
+      // Trigger OS deep link to load the thread in Desktop
+      const { exec } = require("node:child_process");
+      const url = `codex://threads/${conversationId}`;
+      exec(
+        `start "" "${url}"`,
+        { windowsHide: true, shell: "cmd.exe" },
+        (error) => {
+          if (error) {
+            clearTimeout(timer);
+            this.transport.off("broadcast", onBroadcast);
+            resolve({ ok: false, error: error.message });
+          }
+        }
+      );
+    });
   }
 
   async sendMessage(conversationId, text) {

@@ -35,8 +35,9 @@ function relativeTime(value, now = Date.now()) {
 function formatThread(thread, index, now = Date.now()) {
   const title = thread.title || thread.conversationId || "未命名会话";
   const id = thread.conversationId || thread.id || "";
+  const tag = thread.sendable ? "●" : "○";
   return [
-    `${index + 1}. ${title}`,
+    `${index + 1}. ${tag} ${title}`,
     `   ${id.slice(0, 8)}`,
     `   ${relativeTime(thread.updatedAt, now)}`
   ].join("\n");
