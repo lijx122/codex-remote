@@ -59,7 +59,7 @@ class CodexFollowerCore {
       if (archivedIds.has(idx.id)) continue;
       merged.set(idx.id, {
         id: idx.id,
-        title: idx.title || idx.id,
+        title: idx.title || this.getThreadFirstMessage(idx.id) || idx.id,
         updatedAt: idx.updatedAt || null,
         sessionId: idx.sessionId || null,
         cwd: idx.cwd || this.getThreadCwd(idx.id),
@@ -77,7 +77,7 @@ class CodexFollowerCore {
       if (!activeIds.has(row.id)) continue;
       merged.set(row.id, {
         id: row.id,
-        title: row.title || row.id,
+        title: row.title || this.getThreadFirstMessage(row.id) || row.id,
         updatedAt: null,
         sessionId: null,
         cwd: this.getThreadCwd(row.id),
@@ -224,6 +224,34 @@ class CodexFollowerCore {
         if (buf.length > 524288) break; // safety: 512KB max for first line
       }
       fs.closeSync(fd);
+    } catch {
+      // Locked or malformed file
+    }
+    return null;
+  }
+
+  getThreadFirstMessage(threadId) {
+    // Read first user message from rollout file for title fallback
+    const rolloutPath = this.findRolloutPath(threadId);
+    if (!rolloutPath) return null;
+
+    try {
+      const raw = fs.readFileSync(rolloutPath, "utf8");
+      for (const line of raw.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line);
+          if (entry.type !== "response_item" || !entry.payload) continue;
+          if (entry.payload.type !== "message" || entry.payload.role !== "user") continue;
+          const content = entry.payload.content;
+          if (Array.isArray(content)) {
+            const text = content.map(c => c.text || "").join(" ").trim();
+            if (text) return text;
+          }
+        } catch {
+          continue;
+        }
+      }
     } catch {
       // Locked or malformed file
     }

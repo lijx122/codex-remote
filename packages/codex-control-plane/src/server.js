@@ -243,6 +243,25 @@ function createControlPlaneServer(options = {}) {
         return;
       }
 
+      if (req.method === "GET" && url.pathname === "/api/wx/status") {
+        const runtimeDir = process.env.CODEX_REMOTE_RUNTIME_DIR || path.resolve(__dirname, "..", "..", "..", "adapters", "wxbot", ".runtime");
+        const qrcodeUrlPath = path.join(runtimeDir, "ilink-qrcode-url.txt");
+        const tokenPath = path.join(runtimeDir, "ilink-bot-token.json");
+        
+        try {
+          const hasToken = await fs.access(tokenPath).then(() => true).catch(() => false);
+          if (hasToken) {
+            await sendJson(res, 200, { status: "logged_in" });
+          } else {
+            const qrcodeUrl = await fs.readFile(qrcodeUrlPath, "utf8").catch(() => "");
+            await sendJson(res, 200, { status: "waiting", qrcodeUrl: qrcodeUrl });
+          }
+        } catch (err) {
+          await sendJson(res, 200, { status: "waiting", qrcodeUrl: "" });
+        }
+        return;
+      }
+
       if (req.method === "GET") {
         await sendStatic(res, url.pathname);
         return;

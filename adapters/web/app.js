@@ -39,6 +39,32 @@ els.sidebarToggle.addEventListener("click", () => els.sidebar.classList.toggle("
 initResize();
 
 loadThreads();
+checkWxStatus();
+setInterval(checkWxStatus, 5000);
+
+/* ── WeChat QR ── */
+
+const wxQrSection = document.getElementById("wxQrSection");
+const wxQrContainer = document.getElementById("wxQrContainer");
+const wxQrClose = document.getElementById("wxQrClose");
+
+wxQrClose.addEventListener("click", () => wxQrSection.classList.add("hidden"));
+
+async function checkWxStatus() {
+  try {
+    const data = await api("/api/wx/status");
+    if (data.status === "logged_in") {
+      wxQrSection.classList.add("hidden");
+      return;
+    }
+    if (data.qrcodeUrl) {
+      wxQrSection.classList.remove("hidden");
+      wxQrContainer.innerHTML = `<img src="${esc(data.qrcodeUrl)}" alt="微信二维码" class="wx-qr-img" onerror="this.alt='QR 加载失败，请查看终端'"/>`;
+    }
+  } catch {
+    // Status endpoint unavailable — skip
+  }
+}
 
 /* ── API ── */
 

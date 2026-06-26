@@ -418,3 +418,46 @@ body {
   }
   #sidebar.open { transform: translateX(0); }
 }
+
+/* ── WeChat QR Section ── */
+
+.wx-qr {
+  padding: 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-card);
+}
+.wx-qr.hidden { display: none; }
+
+.wx-qr-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+.wx-qr-header .btn-icon {
+  width: 20px; height: 20px;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+#wxQrContainer {
+  text-align: center;
+  margin-bottom: 6px;
+}
+.wx-qr-img {
+  width: 140px; height: 140px;
+  border-radius: 6px;
+}
+
+.wx-qr-hint {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+}

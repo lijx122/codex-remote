@@ -26,7 +26,7 @@ const { ILinkClient, textFromIlinkMessage, extractMediaItems } = require("../src
 const ilinkClient = new ILinkClient();
 const controlPlaneUrl = process.env.CODEX_CONTROL_PLANE_URL || "http://127.0.0.1:8787";
 
-const RUNTIME_DIR = path.resolve(__dirname, "..", ".runtime");
+const RUNTIME_DIR = process.env.CODEX_REMOTE_RUNTIME_DIR || path.resolve(__dirname, "..", ".runtime");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "ilink-bot-token.json");
 
 let botToken = process.env.ILINK_BOT_TOKEN || loadTokenFromFile();
@@ -176,6 +176,13 @@ async function loginByQrcode() {
   process.stdout.write("\nScan the WeChat login QR code.\n");
   if (qrcode.qrcodeUrl) {
     process.stdout.write(`QR URL: ${qrcode.qrcodeUrl}\n`);
+    try {
+      const qrcodeTerminal = require('qrcode-terminal');
+      process.stdout.write('\n======================================\n');
+      process.stdout.write('请使用微信扫描下方二维码登录 Bot：\n');
+      qrcodeTerminal.generate(qrcode.qrcodeUrl, {small: true});
+      process.stdout.write('======================================\n\n');
+    } catch (err) {}
   }
   process.stdout.write("Waiting for confirmation...\n");
 
@@ -205,7 +212,7 @@ async function loginByQrcode() {
 }
 
 async function writeQrcodeArtifact(response) {
-  const runtimeDir = path.resolve(__dirname, "..", ".runtime");
+  const runtimeDir = RUNTIME_DIR;
   fs.mkdirSync(runtimeDir, { recursive: true });
 
   const rawPath = path.join(runtimeDir, "ilink-qrcode-response.json");
@@ -314,3 +321,4 @@ function shortId(value) {
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
