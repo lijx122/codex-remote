@@ -52,6 +52,23 @@ class CodexFollowerCore {
       indexMap.set(idx.id, idx);
     }
 
+    // Build map of rollout paths to speed up getThreadCwd and getThreadFirstMessage
+    const rolloutMap = new Map();
+    const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+    for (const rootName of ["sessions", "archived_sessions"]) {
+      const root = path.join(this.codexHome, rootName);
+      for (const p of walkJsonlFiles(root)) {
+        const m = p.match(uuidRe);
+        if (m) rolloutMap.set(m[0], p);
+      }
+    }
+
+    const isUuid = (str) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(str || ""));
+    const getCleanTitle = (title, id) => {
+      if (!title || title === id || isUuid(title)) return null;
+      return title;
+    };
+
     const merged = new Map();
 
     // Pass 1: index entries (non-archived)
@@ -59,10 +76,10 @@ class CodexFollowerCore {
       if (archivedIds.has(idx.id)) continue;
       merged.set(idx.id, {
         id: idx.id,
-        title: idx.title || this.getThreadFirstMessage(idx.id) || idx.id,
+        title: getCleanTitle(idx.title, idx.id) || this.getThreadFirstMessage(idx.id, rolloutMap) || idx.id,
         updatedAt: idx.updatedAt || null,
         sessionId: idx.sessionId || null,
-        cwd: idx.cwd || this.getThreadCwd(idx.id),
+        cwd: idx.cwd || this.getThreadCwd(idx.id, rolloutMap),
         runtimeStatus: null,
         sendable: this.threads.has(idx.id),
         raw: idx.raw || {}
@@ -71,16 +88,16 @@ class CodexFollowerCore {
 
     // Pass 2: SQLite threads not in index (catch recently created / unindexed)
     // Only include if rollout file exists in sessions/ (not archived_sessions/)
-    const activeIds = this.getActiveThreadIds();
+    const activeIds = this.getActiveThreadIds(rolloutMap);
     for (const row of this.getNonArchivedThreadsFromDb()) {
       if (merged.has(row.id)) continue;
       if (!activeIds.has(row.id)) continue;
       merged.set(row.id, {
         id: row.id,
-        title: row.title || this.getThreadFirstMessage(row.id) || row.id,
+        title: getCleanTitle(row.title, row.id) || this.getThreadFirstMessage(row.id, rolloutMap) || row.id,
         updatedAt: null,
         sessionId: null,
-        cwd: this.getThreadCwd(row.id),
+        cwd: this.getThreadCwd(row.id, rolloutMap),
         runtimeStatus: null,
         sendable: this.threads.has(row.id),
         raw: {}
@@ -90,12 +107,15 @@ class CodexFollowerCore {
     // Pass 3: overlay broadcast data (always more current)
     for (const thread of this.threads.values()) {
       const existing = merged.get(thread.id);
+      const broadcastTitle = getCleanTitle(thread.title, thread.id);
+      const existingTitle = existing && existing.title && !isUuid(existing.title) ? existing.title : null;
+
       merged.set(thread.id, {
         id: thread.id,
-        title: thread.title || (existing && existing.title) || thread.id,
+        title: broadcastTitle || existingTitle || this.getThreadFirstMessage(thread.id, rolloutMap) || thread.id,
         updatedAt: thread.updatedAt || (existing && existing.updatedAt) || null,
         sessionId: thread.sessionId || (existing && existing.sessionId) || null,
-        cwd: thread.cwd || (existing && existing.cwd) || this.getThreadCwd(thread.id),
+        cwd: thread.cwd || (existing && existing.cwd) || this.getThreadCwd(thread.id, rolloutMap),
         runtimeStatus: thread.runtimeStatus || null,
         sendable: true,
         raw: thread.raw || {}
@@ -107,19 +127,27 @@ class CodexFollowerCore {
     );
   }
 
-  getActiveThreadIds() {
+  getActiveThreadIds(rolloutMap) {
     // Only threads with a rollout file in sessions/ (not archived_sessions) are active
     // Also excludes threads marked archived=1 in state_5.sqlite
     const ids = new Set();
-    const sessionsRoot = path.join(this.codexHome, "sessions");
-    const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
-    try {
-      for (const file of walkJsonlFiles(sessionsRoot)) {
-        const m = file.match(uuidRe);
-        if (m) ids.add(m[0]);
+    if (rolloutMap) {
+      for (const [id, p] of rolloutMap.entries()) {
+        if (p.includes(path.sep + "sessions" + path.sep)) {
+          ids.add(id);
+        }
       }
-    } catch {
-      // Directory might not exist
+    } else {
+      const sessionsRoot = path.join(this.codexHome, "sessions");
+      const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+      try {
+        for (const file of walkJsonlFiles(sessionsRoot)) {
+          const m = file.match(uuidRe);
+          if (m) ids.add(m[0]);
+        }
+      } catch {
+        // Directory might not exist
+      }
     }
     // Subtract threads archived in SQLite
     for (const id of this.getArchivedIdsFromDb()) {
@@ -195,13 +223,13 @@ class CodexFollowerCore {
     return threads;
   }
 
-  getThreadCwd(threadId) {
+  getThreadCwd(threadId, rolloutMap) {
     // Check cache from broadcasts first
     const cached = this.threads.get(threadId);
     if (cached && cached.cwd) return cached.cwd;
 
     // Read first line of rollout file for session_meta.cwd
-    const rolloutPath = this.findRolloutPath(threadId);
+    const rolloutPath = this.findRolloutPath(threadId, rolloutMap);
     if (!rolloutPath) return null;
 
     try {
@@ -230,9 +258,26 @@ class CodexFollowerCore {
     return null;
   }
 
-  getThreadFirstMessage(threadId) {
-    // Read first user message from rollout file for title fallback
-    const rolloutPath = this.findRolloutPath(threadId);
+  getThreadFirstMessage(threadId, rolloutMap) {
+    // 1. Try to extract from memory cache first (most real-time and avoids disk IO)
+    const cached = this.threads.get(threadId);
+    if (cached && cached.raw && Array.isArray(cached.raw.turns)) {
+      for (const turn of cached.raw.turns) {
+        if (!turn || !Array.isArray(turn.items)) continue;
+        for (const item of turn.items) {
+          if (item.type === "userMessage" && Array.isArray(item.content)) {
+            const text = item.content.map(c => c.text || "").join(" ").trim();
+            if (text) return text;
+          }
+          if (item.role === "user" && item.text) {
+            return item.text.trim();
+          }
+        }
+      }
+    }
+
+    // 2. Fall back to reading first user message from rollout file
+    const rolloutPath = this.findRolloutPath(threadId, rolloutMap);
     if (!rolloutPath) return null;
 
     try {
@@ -374,7 +419,10 @@ class CodexFollowerCore {
     return fromIndex && fromIndex.title ? fromIndex.title : conversationId;
   }
 
-  findRolloutPath(conversationId) {
+  findRolloutPath(conversationId, rolloutMap) {
+    if (rolloutMap && rolloutMap.has(conversationId)) {
+      return rolloutMap.get(conversationId);
+    }
     for (const rootName of ["sessions", "archived_sessions"]) {
       const root = path.join(this.codexHome, rootName);
       const found = findFileByName(root, conversationId);
@@ -707,7 +755,7 @@ function walkJsonlFiles(root) {
   for (const entry of entries) {
     const fullPath = path.join(root, entry.name);
     if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-      files.push(entry.name);
+      files.push(fullPath);
     } else if (entry.isDirectory()) {
       files.push(...walkJsonlFiles(fullPath));
     }
