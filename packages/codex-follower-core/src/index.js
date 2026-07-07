@@ -45,7 +45,9 @@ class CodexFollowerCore {
     // Base: session_index (authoritative for what exists on disk)
     // Supplement: SQLite for threads not in index (e.g. recently created)
     // Overlay: this.threads (Desktop broadcast, live state)
-    const archivedIds = this.getArchivedIdsFromDb();
+    const dbRows = this.getThreadRowsFromDb();
+    const dbThreadMap = new Map(dbRows.map((row) => [row.id, row]));
+    const archivedIds = archivedIdsFromRows(dbRows);
     const indexEntries = this.readSessionIndex();
     const indexMap = new Map();
     for (const idx of indexEntries) {
@@ -74,6 +76,7 @@ class CodexFollowerCore {
     // Pass 1: index entries (non-archived)
     for (const idx of indexEntries) {
       if (archivedIds.has(idx.id)) continue;
+      if (this.isSubagentThread(idx, dbThreadMap.get(idx.id), rolloutMap)) continue;
       merged.set(idx.id, {
         id: idx.id,
         title: getCleanTitle(idx.title, idx.id) || this.getThreadFirstMessage(idx.id, rolloutMap) || idx.id,
@@ -88,9 +91,11 @@ class CodexFollowerCore {
 
     // Pass 2: SQLite threads not in index (catch recently created / unindexed)
     // Only include if rollout file exists in sessions/ (not archived_sessions/)
-    const activeIds = this.getActiveThreadIds(rolloutMap);
-    for (const row of this.getNonArchivedThreadsFromDb()) {
+    const activeIds = this.getActiveThreadIds(rolloutMap, archivedIds);
+    for (const row of dbRows) {
       if (merged.has(row.id)) continue;
+      if (archivedIds.has(row.id)) continue;
+      if (this.isSubagentThread(row, row, rolloutMap)) continue;
       if (!activeIds.has(row.id)) continue;
       merged.set(row.id, {
         id: row.id,
@@ -106,6 +111,7 @@ class CodexFollowerCore {
 
     // Pass 3: overlay broadcast data (always more current)
     for (const thread of this.threads.values()) {
+      if (this.isSubagentThread(thread, dbThreadMap.get(thread.id), rolloutMap)) continue;
       const existing = merged.get(thread.id);
       const broadcastTitle = getCleanTitle(thread.title, thread.id);
       const existingTitle = existing && existing.title && !isUuid(existing.title) ? existing.title : null;
@@ -127,7 +133,7 @@ class CodexFollowerCore {
     );
   }
 
-  getActiveThreadIds(rolloutMap) {
+  getActiveThreadIds(rolloutMap, archivedIds) {
     // Only threads with a rollout file in sessions/ (not archived_sessions) are active
     // Also excludes threads marked archived=1 in state_5.sqlite
     const ids = new Set();
@@ -150,41 +156,32 @@ class CodexFollowerCore {
       }
     }
     // Subtract threads archived in SQLite
-    for (const id of this.getArchivedIdsFromDb()) {
+    for (const id of archivedIds || this.getArchivedIdsFromDb()) {
       ids.delete(id);
     }
     return ids;
   }
 
   getArchivedIdsFromDb() {
-    if (!Database) return new Set();
+    return archivedIdsFromRows(this.getThreadRowsFromDb());
+  }
+
+  getThreadRowsFromDb() {
+    if (!Database) return [];
     const dbPath = path.join(this.codexHome, "state_5.sqlite");
     let db;
     try {
       db = new Database(dbPath, { readonly: true });
-      const rows = db.prepare("SELECT id FROM threads WHERE archived = 1").all();
-      return new Set(rows.map(r => r.id));
+      return db.prepare("SELECT * FROM threads ORDER BY rowid DESC").all();
     } catch {
-      return new Set();
+      return [];
     } finally {
       if (db) db.close();
     }
   }
 
   getNonArchivedThreadsFromDb() {
-    if (!Database) return [];
-    const dbPath = path.join(this.codexHome, "state_5.sqlite");
-    let db;
-    try {
-      db = new Database(dbPath, { readonly: true });
-      return db
-        .prepare("SELECT id, title FROM threads WHERE archived = 0 OR archived IS NULL ORDER BY rowid DESC")
-        .all();
-    } catch {
-      return [];
-    } finally {
-      if (db) db.close();
-    }
+    return this.getThreadRowsFromDb().filter((row) => Number(row.archived) !== 1);
   }
 
   readSessionIndex() {
@@ -229,6 +226,11 @@ class CodexFollowerCore {
     if (cached && cached.cwd) return cached.cwd;
 
     // Read first line of rollout file for session_meta.cwd
+    const meta = this.readThreadMeta(threadId, rolloutMap);
+    return meta && meta.cwd ? meta.cwd : null;
+  }
+
+  readThreadMeta(threadId, rolloutMap) {
     const rolloutPath = this.findRolloutPath(threadId, rolloutMap);
     if (!rolloutPath) return null;
 
@@ -244,8 +246,8 @@ class CodexFollowerCore {
           fs.closeSync(fd);
           const firstLine = buf.toString("utf8", 0, newline);
           const entry = JSON.parse(firstLine);
-          if (entry.type === "session_meta" && entry.payload && entry.payload.cwd) {
-            return entry.payload.cwd;
+          if (entry.type === "session_meta" && entry.payload) {
+            return entry.payload;
           }
           return null;
         }
@@ -256,6 +258,16 @@ class CodexFollowerCore {
       // Locked or malformed file
     }
     return null;
+  }
+
+  isSubagentThread(thread, dbThread, rolloutMap) {
+    if (isSubagentRecord(thread) || isSubagentRecord(thread && thread.raw) || isSubagentRecord(dbThread)) {
+      return true;
+    }
+
+    const threadId = thread && (thread.id || thread.conversationId);
+    if (!threadId) return false;
+    return isSubagentRecord(this.readThreadMeta(threadId, rolloutMap));
   }
 
   getThreadFirstMessage(threadId, rolloutMap) {
@@ -717,6 +729,39 @@ class CodexFollowerCore {
 
 function createCodexFollower(options) {
   return new CodexFollowerCore(options);
+}
+
+function archivedIdsFromRows(rows) {
+  return new Set((rows || [])
+    .filter((row) => row && Number(row.archived) === 1)
+    .map((row) => row.id)
+    .filter(Boolean));
+}
+
+function isSubagentRecord(record) {
+  if (!record || typeof record !== "object") return false;
+
+  const threadSource = record.thread_source || record.threadSource;
+  if (String(threadSource || "").toLowerCase() === "subagent") return true;
+
+  const source = record.source;
+  if (!source) return false;
+
+  if (typeof source === "string") {
+    try {
+      return isSubagentSource(JSON.parse(source));
+    } catch {
+      return source.toLowerCase().includes("subagent");
+    }
+  }
+
+  return isSubagentSource(source);
+}
+
+function isSubagentSource(source) {
+  if (!source || typeof source !== "object") return false;
+  if (source.subagent) return true;
+  return String(source.thread_source || source.threadSource || "").toLowerCase() === "subagent";
 }
 
 function defaultCodexHome() {

@@ -5,6 +5,7 @@
   "bin": "app.js",
   "scripts": {
     "start": "node app.js",
+    "test": "node packages/codex-follower-core/test/list-threads.test.js",
     "build": "pkg app.js --targets node18-win-x64 --output CodexRemote.exe"
   },
   "pkg": {
