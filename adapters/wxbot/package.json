@@ -8,7 +8,7 @@
     "codex-wxbot-http": "bin/http-bridge.js"
   },
   "scripts": {
-    "check": "node --check src/index.js && node --check src/adapter.js && node --check src/control-plane-client.js && node --check src/ilink-client.js && node --check src/message-utils.js && node --check bin/console.js && node --check bin/http-bridge.js && node --check bin/ilink.js && node --check test/self-test.js",
+    "check": "node --check src/index.js && node --check src/adapter.js && node --check src/control-plane-client.js && node --check src/ilink-client.js && node --check src/inbound-queue.js && node --check src/message-utils.js && node --check bin/console.js && node --check bin/http-bridge.js && node --check bin/ilink.js && node --check test/self-test.js",
     "test": "node test/self-test.js"
   }
 }

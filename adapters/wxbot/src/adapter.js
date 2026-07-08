@@ -21,11 +21,13 @@ class WxBotAdapter {
     this.maxThreads = options.maxThreads || 20;
     this.now = options.now || (() => Date.now());
     this.logger = options.logger || console;
+    this.onTurnSettled = typeof options.onTurnSettled === "function" ? options.onTurnSettled : null;
 
     this.currentConversationId = "";
     this.currentThread = null;
     this.lastCompletedAssistantMessage = "";
     this.lastCompletedTurnId = "";
+    this.pendingApprovalId = "";
     this.socket = null;
     this.reconnectTimer = null;
   }
@@ -55,6 +57,9 @@ class WxBotAdapter {
     if (command === "/stop") return this.commandStop();
     if (command === "/history") return this.commandHistory();
     if (command === "/help") return this.commandHelp();
+    if (command === "/approve") return this.commandApprove(arg);
+    if (command === "/y") return this.commandApprove("yes");
+    if (command === "/n") return this.commandApprove("no");
 
     await this.reply("未知命令，发送 /help 查看可用命令");
   }
@@ -100,6 +105,10 @@ class WxBotAdapter {
       this.currentThread = refreshed.find(
         (t) => (t.conversationId || t.id) === this.currentConversationId
       ) || thread;
+      if (!this.currentThread.sendable) {
+        await this.reply("会话正在打开，但暂时还不能发送。请稍后重试 /q。");
+        return;
+      }
     }
 
     this.connectEvents();
@@ -138,6 +147,24 @@ class WxBotAdapter {
     if (!await this.requireConversation()) return;
     await this.client.interrupt(this.currentConversationId);
     await this.reply("已发送中断请求");
+  }
+
+  async commandApprove(arg) {
+    if (!this.pendingApprovalId) {
+      await this.reply("当前没有待审批请求");
+      return;
+    }
+    const normalized = String(arg || "").trim().toLowerCase();
+    const allow = normalized === "yes" || normalized === "y" || normalized === "allow" || normalized === "true";
+    const deny = normalized === "no" || normalized === "n" || normalized === "deny" || normalized === "false";
+    if (!allow && !deny) {
+      await this.reply("用法：/approve yes 或 /approve no");
+      return;
+    }
+    const approvalId = this.pendingApprovalId;
+    this.pendingApprovalId = "";
+    await this.client.approve(this.currentConversationId, approvalId, allow);
+    await this.reply(allow ? "已批准" : "已拒绝");
   }
 
   async commandHistory() {
@@ -215,9 +242,27 @@ class WxBotAdapter {
 
     if (event.type === "turn_completed") {
       await this.handleTurnCompleted(event.payload || {});
+    } else if (event.type === "approval_request") {
+      await this.handleApprovalRequest(event);
     } else if (event.type === "error") {
       await this.reply(`执行失败\n\n错误：\n${(event.payload && event.payload.message) || "未知错误"}`);
     }
+  }
+
+  async handleApprovalRequest(event) {
+    const payload = event.payload || event;
+    const approvalId = event.approvalId || payload.approvalId || payload.id || "";
+    if (!approvalId) return;
+    this.pendingApprovalId = approvalId;
+    const raw = payload.raw || event.raw || {};
+    const params = raw.params || {};
+    const command = raw.command || params.command || params.cmd || "";
+    await this.reply([
+      "需要审批：",
+      command || JSON.stringify(raw),
+      "",
+      "回复 /y 批准，/n 拒绝"
+    ].join("\n"));
   }
 
   async handleTurnCompleted(payload) {
@@ -236,6 +281,10 @@ class WxBotAdapter {
       await this.reply(latest.text);
     } catch (e) {
       this.logger.warn && this.logger.warn("Failed to load history for turn_completed", e);
+    } finally {
+      if (this.onTurnSettled) {
+        await this.onTurnSettled({ conversationId: this.currentConversationId, turnId });
+      }
     }
   }
 

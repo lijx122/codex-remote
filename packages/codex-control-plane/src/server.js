@@ -90,6 +90,36 @@ function createControlPlaneServer(options = {}) {
     }
   }
 
+  async function sendMessageWithWarmRetry(conversationId, message) {
+    const maxAttempts = 4;
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        const result = await core.sendMessage(conversationId, message);
+        logCommand(attempt === 1 ? "send.result" : "send.retry.result", {
+          conversationId,
+          ok: result.ok,
+          attempt
+        });
+        return result;
+      } catch (error) {
+        lastError = error;
+        const errMsg = String(error.message || "");
+        logCommand(attempt === 1 ? "send.error" : "send.retry.error", {
+          conversationId,
+          error: errMsg,
+          attempt
+        });
+        if (!/no-client-found|not found/i.test(errMsg) || attempt === maxAttempts) break;
+        logCommand("warm.before-retry", { conversationId, attempt });
+        const warmResult = await core.warmThread(conversationId);
+        logCommand("warm.before-retry.result", { conversationId, attempt, ...warmResult });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+    throw lastError;
+  }
+
   async function readJson(req) {
     const chunks = [];
     for await (const chunk of req) {
@@ -164,44 +194,13 @@ function createControlPlaneServer(options = {}) {
           messageLength: typeof body.message === "string" ? body.message.length : 0
         });
         try {
-          const result = await core.sendMessage(body.conversationId, body.message);
-          logCommand("send.result", {
-            conversationId: body.conversationId,
-            ok: result.ok
-          });
+          const result = await sendMessageWithWarmRetry(body.conversationId, body.message);
           await sendJson(res, 200, { ok: true, raw: result.raw });
         } catch (error) {
           const errMsg = String(error.message || "");
-          logCommand("send.error", {
-            conversationId: body.conversationId,
-            error: errMsg
-          });
-
-          // Auto-warm: trigger deep link, wait for broadcast, then retry once
-          if (/no-client-found|not found/i.test(errMsg)) {
-            logCommand("warm.before-retry", { conversationId: body.conversationId });
-            const warmResult = await core.warmThread(body.conversationId);
-            logCommand("warm.before-retry.result", { conversationId: body.conversationId, ...warmResult });
-            if (warmResult.ok) {
-              // Give Desktop a moment to fully load the thread
-              await new Promise((r) => setTimeout(r, 1000));
-              try {
-                const retryResult = await core.sendMessage(body.conversationId, body.message);
-                logCommand("send.retry.result", { conversationId: body.conversationId, ok: retryResult.ok });
-                await sendJson(res, 200, { ok: true, raw: retryResult.raw });
-                return;
-              } catch (retryError) {
-                logCommand("send.retry.error", {
-                  conversationId: body.conversationId,
-                  error: String(retryError.message || "")
-                });
-              }
-            }
-          }
-
           await sendJson(res, 409, {
             ok: false,
-            error: "会话未在 Desktop 中打开，请先在 Desktop 中打开此会话",
+            error: "会话自动打开后仍不可发送，请稍后重试",
             detail: errMsg
           });
         }

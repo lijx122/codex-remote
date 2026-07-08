@@ -2,12 +2,17 @@
 
 const { WxBotAdapter, createWxBotAdapter } = require("./adapter");
 const { ControlPlaneClient } = require("./control-plane-client");
-const { ILinkClient, textFromIlinkMessage } = require("./ilink-client");
+const { InboundMessageQueue, buildCodexPayload } = require("./inbound-queue");
+const { ILinkClient, downloadMediaItems, extractMediaItems, textFromIlinkMessage } = require("./ilink-client");
 
 module.exports = {
+  buildCodexPayload,
   ControlPlaneClient,
   ILinkClient,
+  InboundMessageQueue,
   WxBotAdapter,
   createWxBotAdapter,
+  downloadMediaItems,
+  extractMediaItems,
   textFromIlinkMessage
 };

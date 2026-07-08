@@ -458,10 +458,12 @@ class CodexFollowerCore {
     this.assertConversationId(conversationId);
 
     // Already loaded — nothing to do
-    if (this.threads.has(conversationId)) return { ok: true, alreadyLoaded: true };
+    const alreadyKnown = this.threads.has(conversationId);
+    const openResult = await openThreadDeepLink(conversationId);
+    if (!openResult.ok) return openResult;
 
-    return new Promise((resolve) => {
-      const timeoutMs = 15000;
+    const broadcastResult = await new Promise((resolve) => {
+      const timeoutMs = alreadyKnown ? 3000 : 15000;
       const timer = setTimeout(() => {
         this.transport.off("broadcast", onBroadcast);
         resolve({ ok: false, timeout: true });
@@ -479,22 +481,15 @@ class CodexFollowerCore {
       };
 
       this.transport.on("broadcast", onBroadcast);
-
-      // Trigger OS deep link to load the thread in Desktop
-      const { exec } = require("node:child_process");
-      const url = `codex://threads/${conversationId}`;
-      exec(
-        `start "" "${url}"`,
-        { windowsHide: true, shell: "cmd.exe" },
-        (error) => {
-          if (error) {
-            clearTimeout(timer);
-            this.transport.off("broadcast", onBroadcast);
-            resolve({ ok: false, error: error.message });
-          }
-        }
-      );
     });
+    if (!broadcastResult.ok && !this.threads.has(conversationId)) return broadcastResult;
+    await sleep(1500);
+    return {
+      ok: true,
+      alreadyLoaded: alreadyKnown,
+      broadcast: broadcastResult.ok,
+      sendable: this.threads.has(conversationId)
+    };
   }
 
   async sendMessage(conversationId, text) {
@@ -729,6 +724,24 @@ class CodexFollowerCore {
 
 function createCodexFollower(options) {
   return new CodexFollowerCore(options);
+}
+
+function openThreadDeepLink(conversationId) {
+  return new Promise((resolve) => {
+    const { exec } = require("node:child_process");
+    const url = `codex://threads/${conversationId}`;
+    exec(
+      `start "" "${url}"`,
+      { windowsHide: true, shell: "cmd.exe" },
+      (error) => {
+        resolve(error ? { ok: false, error: error.message } : { ok: true });
+      }
+    );
+  });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function archivedIdsFromRows(rows) {

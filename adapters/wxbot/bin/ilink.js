@@ -21,6 +21,7 @@ const path = require("node:path");
 })();
 
 const { createWxBotAdapter } = require("../src");
+const { InboundMessageQueue } = require("../src/inbound-queue");
 const { ILinkClient, textFromIlinkMessage, extractMediaItems } = require("../src/ilink-client");
 
 const ilinkClient = new ILinkClient();
@@ -28,10 +29,12 @@ const controlPlaneUrl = process.env.CODEX_CONTROL_PLANE_URL || "http://127.0.0.1
 
 const RUNTIME_DIR = process.env.CODEX_REMOTE_RUNTIME_DIR || path.resolve(__dirname, "..", ".runtime");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "ilink-bot-token.json");
+const MEDIA_DIR = path.join(RUNTIME_DIR, "media");
 
 let botToken = process.env.ILINK_BOT_TOKEN || loadTokenFromFile();
 let getUpdatesBuf = "";
 let currentTarget = null;
+let replyTarget = null;
 let stopping = false;
 
 function loadTokenFromFile() {
@@ -59,31 +62,57 @@ function saveTokenToFile(token) {
   }
 }
 
+async function sendWechatText(target, text) {
+  if (!botToken) {
+    process.stdout.write(`[WX OUT skipped: not logged in]\n${text}\n`);
+    return;
+  }
+  if (!target || !target.toUserId) {
+    process.stdout.write(`[WX OUT skipped: no target]\n${text}\n`);
+    return;
+  }
+
+  try {
+    await ilinkClient.sendTextMessage(botToken, target.toUserId, text, target.contextToken || "");
+    process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "out", to: shortId(target.toUserId), length: text.length })}\n`);
+  } catch (e) {
+    if (String(e.message).includes("401")) {
+      process.stdout.write(`[WX OUT error] Token expired (401) during send. Clearing token.\n`);
+      botToken = "";
+      process.exitCode = 1;
+      process.exit();
+    }
+    throw e;
+  }
+}
+
+let inboundQueue;
+
 const adapter = createWxBotAdapter({
   controlPlaneUrl,
+  onTurnSettled: () => {
+    if (!inboundQueue) return;
+    inboundQueue.markSettled();
+    if (!inboundQueue.busy) replyTarget = null;
+  },
   sendText: async (text) => {
-    if (!botToken) {
-      process.stdout.write(`[WX OUT skipped: not logged in]\n${text}\n`);
-      return;
-    }
-    if (!currentTarget || !currentTarget.toUserId) {
-      process.stdout.write(`[WX OUT skipped: no target]\n${text}\n`);
-      return;
-    }
+    await sendWechatText(replyTarget || currentTarget, text);
+  }
+});
 
-    // Wrap the sendTextMessage in a try-catch to auto-recover if it's a 401 error
-    try {
-      await ilinkClient.sendTextMessage(botToken, currentTarget.toUserId, text, currentTarget.contextToken || "");
-      process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "out", to: shortId(currentTarget.toUserId), length: text.length })}\n`);
-    } catch (e) {
-      if (String(e.message).includes("401")) {
-        process.stdout.write(`[WX OUT error] Token expired (401) during send. Clearing token.\n`);
-        botToken = "";
-        process.exitCode = 1;
-        process.exit();
-      }
-      throw e;
-    }
+inboundQueue = new InboundMessageQueue({
+  mergeWindowMs: Number(process.env.WXBOT_MERGE_WINDOW_MS || 0),
+  textMergeWindowMs: Number(process.env.WXBOT_TEXT_MERGE_WINDOW_MS || process.env.WXBOT_MERGE_WINDOW_MS || 0),
+  voiceMergeWindowMs: Number(process.env.WXBOT_VOICE_MERGE_WINDOW_MS || process.env.WXBOT_MERGE_WINDOW_MS || 0),
+  mediaMergeWindowMs: Number(process.env.WXBOT_MEDIA_MERGE_WINDOW_MS || process.env.WXBOT_MERGE_WINDOW_MS || 0),
+  settleDelayMs: Number(process.env.WXBOT_SETTLE_DELAY_MS || 0),
+  pendingTtlMs: Number(process.env.WXBOT_PENDING_TTL_MS || 30 * 60 * 1000),
+  sendToCodex: async (item) => {
+    replyTarget = item.target;
+    await adapter.handleText(item.payload);
+  },
+  onDispatchError: (error, item) => {
+    process.stderr.write(`codex dispatch failed: ${JSON.stringify({ to: shortId(item.target && item.target.toUserId), error: error.message || String(error) })}\n`);
   }
 });
 
@@ -144,21 +173,45 @@ async function main() {
         for (const message of result.msgs || []) {
           const text = textFromIlinkMessage(message);
           const media = extractMediaItems(message);
-          currentTarget = {
+          const target = {
             toUserId: message.from_user_id,
             contextToken: message.context_token || ""
           };
+          currentTarget = target;
 
           if (text) {
             process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "in", from: shortId(message.from_user_id), text })}\n`);
-            await adapter.handleText(text);
-          } else if (media.length > 0) {
+          }
+
+          if (isDirectCommand(text) && media.length === 0) {
+            const previousReplyTarget = replyTarget;
+            replyTarget = target;
+            try {
+              await adapter.handleText(text);
+              if (text === "/stop") inboundQueue.markSettled();
+            } finally {
+              replyTarget = previousReplyTarget;
+            }
+            continue;
+          }
+
+          let mediaResult = { saved: [], errors: [] };
+          if (media.length > 0) {
             const desc = media.map(m => m.desc).join(", ");
             process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "in", from: shortId(message.from_user_id), media: desc })}\n`);
-            // Forward media as text description to Desktop
-            const label = `[收到 ${desc}]`;
-            await adapter.handleText(label);
+            mediaResult = await ilinkClient.downloadMediaItems(media, MEDIA_DIR);
+            if (mediaResult.errors.length) {
+              process.stderr.write(`media save errors: ${JSON.stringify(mediaResult.errors.map(e => ({ type: e.type, error: e.error })))}\n`);
+            }
           }
+
+          const queueResult = inboundQueue.receive({
+            target,
+            text,
+            saved: mediaResult.saved,
+            errors: mediaResult.errors
+          });
+          process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "queue", from: shortId(message.from_user_id), status: queueResult.status, held: queueResult.held || 0, queued: inboundQueue.queue.length, busy: inboundQueue.busy })}\n`);
         }
       } catch (error) {
         if (error && error.name === "TimeoutError") continue;
@@ -316,6 +369,10 @@ function tryRequireQrcode() {
 
 function shortId(value) {
   return String(value || "").slice(0, 8);
+}
+
+function isDirectCommand(text) {
+  return String(text || "").trim().startsWith("/");
 }
 
 function sleep(ms) {
