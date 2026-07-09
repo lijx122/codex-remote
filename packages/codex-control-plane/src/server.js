@@ -6,11 +6,13 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const { URL } = require("node:url");
 const { createCodexFollower } = require("../../codex-follower-core/src");
+const { sendFileFromRuntime } = require("../../../adapters/wxbot/src/sendfile-service");
 
 const EVENT_TYPES = new Set([
   "message",
   "turn_started",
   "turn_completed",
+  "turn_interrupted",
   "approval_request",
   "approval_response",
   "interrupt",
@@ -27,6 +29,7 @@ const STATIC_TYPES = {
 
 function createControlPlaneServer(options = {}) {
   const core = options.core || createCodexFollower(options.coreOptions || {});
+  const sendFile = options.sendFile || sendFileFromRuntime;
   const clients = new Set();
   let connected = false;
   let connecting = null;
@@ -160,6 +163,15 @@ function createControlPlaneServer(options = {}) {
         return;
       }
 
+      if (req.method === "GET" && url.pathname === "/sendfile") {
+        await sendJson(res, 200, {
+          ok: true,
+          usage: "POST /sendfile with JSON body {\"path\":\"C:\\\\path\\\\file.png\"}",
+          powershell: "Invoke-RestMethod -Uri http://127.0.0.1:8787/sendfile -Method Post -ContentType 'application/json' -Body (@{ path = 'C:\\path\\file.png' } | ConvertTo-Json)"
+        });
+        return;
+      }
+
       if (req.method === "GET" && url.pathname === "/threads") {
         await ensureConnected();
         await new Promise((resolve) => setTimeout(resolve, 300));
@@ -202,6 +214,35 @@ function createControlPlaneServer(options = {}) {
             ok: false,
             error: "会话自动打开后仍不可发送，请稍后重试",
             detail: errMsg
+          });
+        }
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/sendfile") {
+        const body = await readJson(req);
+        logCommand("sendfile", {
+          path: body.path || body.filePath || "",
+          hasTarget: Boolean(body.toUserId || body.to)
+        });
+        try {
+          const result = await sendFile({
+            path: body.path || body.filePath,
+            caption: body.caption || "",
+            toUserId: body.toUserId || body.to || "",
+            contextToken: body.contextToken || ""
+          });
+          logCommand("sendfile.result", {
+            ok: true,
+            path: result.path,
+            type: result.type,
+            size: result.size
+          });
+          await sendJson(res, 200, result);
+        } catch (error) {
+          await sendJson(res, 409, {
+            ok: false,
+            error: error && error.message ? error.message : String(error)
           });
         }
         return;

@@ -8,7 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { createWxBotAdapter } = require("../src");
 const { InboundMessageQueue } = require("../src/inbound-queue");
-const { extractMediaItems, downloadMediaItems, parseAesKey } = require("../src/ilink-client");
+const { extractMediaItems, downloadMediaItems, ILinkClient, parseAesKey } = require("../src/ilink-client");
 const { splitMessage, summarizeAssistantMessage } = require("../src/message-utils");
 
 class FakeClient {
@@ -21,6 +21,7 @@ class FakeClient {
       { conversationId: "019ee451-eed0-7c21-b1a6-8e56d603e82b", title: "微信Adapter开发", updatedAt: new Date().toISOString(), sendable: true }
     ];
     this.assistantText = "Summary\n\n已完成微信 Adapter MVP。";
+    this.turnStatus = "completed";
   }
 
   async listThreads() {
@@ -34,6 +35,7 @@ class FakeClient {
         turns: [
           {
             turnId: "t1",
+            status: this.turnStatus,
             items: [
               { type: "userMessage", content: [{ type: "text", text: "hello" }] },
               { type: "agentMessage", text: this.assistantText }
@@ -73,6 +75,7 @@ class FakeClient {
     client,
     now: () => Date.now(),
     sendText: async (text) => replies.push(text),
+    sendFile: async (filePath) => ({ fileName: path.basename(filePath), size: 1234, path: filePath }),
     maxMessageLength: 80,
     onTurnSettled: async () => { settledCount += 1; }
   });
@@ -98,8 +101,25 @@ class FakeClient {
   assert.equal(settledCount, 1);
   assert.match(replies.at(-1), /已完成微信 Adapter MVP/);
 
+  client.turnStatus = "running";
+  let reconciled = await adapter.reconcileCurrentTurnState();
+  assert.equal(reconciled.running, true);
+  assert.equal(settledCount, 1);
+
+  client.turnStatus = "interrupted";
+  reconciled = await adapter.reconcileCurrentTurnState();
+  assert.equal(reconciled.running, false);
+  assert.equal(settledCount, 2);
+
+  await adapter.handleEvent({ type: "turn_interrupted", conversationId: adapter.currentConversationId, payload: { turnId: "t2", status: "interrupted" } });
+  assert.equal(settledCount, 3);
+
   await adapter.handleText("/history");
   assert.match(replies.at(-1), /Summary/);
+
+  await adapter.handleText('/sendfile "C:\\tmp\\result screenshot.png"');
+  assert.match(replies.at(-1), /result screenshot\.png/);
+  assert.match(replies.at(-1), /1\.2 KB/);
 
   assert.deepEqual(splitMessage("abc", 2), ["[1/2]\nab", "[2/2]\nc"]);
   assert.equal(summarizeAssistantMessage("## Summary\nhello\n\n## Next\nworld"), "hello");
@@ -168,6 +188,60 @@ class FakeClient {
   });
   assert.equal(downloaded.errors.length, 0);
   assert.equal(fs.readFileSync(downloaded.saved[0].path).toString(), "fake-jpeg-bytes");
+
+  const uploadFilePath = path.join(tmpDir, "result.png");
+  fs.writeFileSync(uploadFilePath, Buffer.from("fake-png-bytes"));
+  const uploadRequests = [];
+  const uploadClient = new ILinkClient({
+    baseUrl: "https://ilink.test",
+    cdnBaseUrl: "https://cdn.test/c2c",
+    fetch: async (url, options = {}) => {
+      uploadRequests.push({ url: String(url), body: options.body ? String(options.body) : "", headers: options.headers || {} });
+      if (String(url).includes("/ilink/bot/getuploadurl")) {
+        const body = JSON.parse(options.body);
+        assert.equal(body.media_type, 1);
+        assert.equal(body.to_user_id, "wxid_test");
+        assert.equal(body.rawsize, Buffer.byteLength("fake-png-bytes"));
+        assert.ok(body.aeskey);
+        assert.equal(body.base_info.channel_version, "2.2.0");
+        assert.equal(options.headers["iLink-App-Id"], "bot");
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ upload_param: "upload-param", upload_full_url: "https://cdn.test/direct-upload" })
+        };
+      }
+      if (String(url).includes("/upload?")) {
+        throw new Error("expected upload_full_url to be preferred");
+      }
+      if (String(url) === "https://cdn.test/direct-upload") {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Map([["x-encrypted-param", "download-param"]]),
+          text: async () => ""
+        };
+      }
+      if (String(url).includes("/ilink/bot/sendmessage")) {
+        const body = JSON.parse(options.body);
+        assert.equal(body.msg.to_user_id, "wxid_test");
+        assert.equal(body.msg.item_list[0].type, 2);
+        assert.equal(body.msg.item_list[0].image_item.media.encrypt_query_param, "download-param");
+        assert.equal(body.msg.item_list[0].image_item.media.aes_key.length, 44);
+        const apiKeyDecoded = Buffer.from(body.msg.item_list[0].image_item.media.aes_key, "base64").toString("ascii");
+        assert.match(apiKeyDecoded, /^[0-9a-f]{32}$/);
+        assert.equal(body.base_info.channel_version, "2.2.0");
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ ret: 0 })
+        };
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }
+  });
+  await uploadClient.sendLocalFileMessage("token", "wxid_test", uploadFilePath, "ctx");
+  assert.equal(uploadRequests.length, 3);
 
   const dispatched = [];
   const queue = new InboundMessageQueue({

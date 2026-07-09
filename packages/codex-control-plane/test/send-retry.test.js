@@ -39,7 +39,14 @@ class FakeCore {
 
 (async () => {
   const core = new FakeCore();
-  const app = createControlPlaneServer({ core });
+  const sentFiles = [];
+  const app = createControlPlaneServer({
+    core,
+    sendFile: async (body) => {
+      sentFiles.push(body);
+      return { ok: true, path: body.path, fileName: "shot.png", size: 42, type: "image" };
+    }
+  });
   const address = await app.listen(0, "127.0.0.1");
   try {
     const response = await postJson(address.port, "/send", {
@@ -50,6 +57,19 @@ class FakeCore {
     assert.equal(response.body.ok, true);
     assert.equal(core.sendAttempts, 3);
     assert.equal(core.warmAttempts, 2);
+
+    const help = await getJson(address.port, "/sendfile");
+    assert.equal(help.statusCode, 200);
+    assert.match(help.body.usage, /POST \/sendfile/);
+
+    const fileResponse = await postJson(address.port, "/sendfile", {
+      path: "C:\\tmp\\shot.png",
+      caption: "done"
+    });
+    assert.equal(fileResponse.statusCode, 200);
+    assert.equal(fileResponse.body.ok, true);
+    assert.equal(sentFiles[0].path, "C:\\tmp\\shot.png");
+    assert.equal(sentFiles[0].caption, "done");
   } finally {
     await app.close();
   }
@@ -81,5 +101,25 @@ function postJson(port, pathname, body) {
     });
     req.on("error", reject);
     req.end(raw);
+  });
+}
+
+function getJson(port, pathname) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: "127.0.0.1",
+      port,
+      path: pathname,
+      method: "GET"
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve({ statusCode: res.statusCode, body: text ? JSON.parse(text) : {} });
+      });
+    });
+    req.on("error", reject);
+    req.end();
   });
 }

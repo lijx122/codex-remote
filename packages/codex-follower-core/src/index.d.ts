@@ -6,6 +6,7 @@ export type CodexFollowerEventType =
   | "message"
   | "turn_started"
   | "turn_completed"
+  | "turn_interrupted"
   | "approval_request"
   | "approval_response"
   | "interrupt"

@@ -1,0 +1,25 @@
+# Codex local skill configuration reference for this project.
+#
+# Source skill:
+#   F:\cx\cx\codex\skills\codex-wechat-sendfile\SKILL.md
+#
+# Runtime endpoint used by the skill:
+#   http://127.0.0.1:8787/sendfile
+#
+# This file is intentionally kept as a project artifact. It documents the
+# expected Codex-side behavior without mutating the user's global config.
+
+[project]
+path = "F:\\cx\\cx\\codex"
+trust_level = "trusted"
+
+[skill]
+name = "codex-wechat-sendfile"
+source = "F:\\cx\\cx\\codex\\skills\\codex-wechat-sendfile\\SKILL.md"
+trigger = "Use when the user asks an agent to send a generated local artifact back to WeChat."
+
+[sendfile]
+endpoint = "http://127.0.0.1:8787/sendfile"
+method = "POST"
+body = "{ path = '<absolute local file path>' }"
+preferred_shell = "powershell"

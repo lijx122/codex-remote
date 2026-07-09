@@ -23,6 +23,7 @@ const path = require("node:path");
 const { createWxBotAdapter } = require("../src");
 const { InboundMessageQueue } = require("../src/inbound-queue");
 const { ILinkClient, textFromIlinkMessage, extractMediaItems } = require("../src/ilink-client");
+const { saveLastTarget, sendFileFromRuntime } = require("../src/sendfile-service");
 
 const ilinkClient = new ILinkClient();
 const controlPlaneUrl = process.env.CODEX_CONTROL_PLANE_URL || "http://127.0.0.1:8787";
@@ -30,6 +31,7 @@ const controlPlaneUrl = process.env.CODEX_CONTROL_PLANE_URL || "http://127.0.0.1
 const RUNTIME_DIR = process.env.CODEX_REMOTE_RUNTIME_DIR || path.resolve(__dirname, "..", ".runtime");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "ilink-bot-token.json");
 const MEDIA_DIR = path.join(RUNTIME_DIR, "media");
+const RECONCILE_MIN_BUSY_MS = Number(process.env.WXBOT_RECONCILE_MIN_BUSY_MS || 2000);
 
 let botToken = process.env.ILINK_BOT_TOKEN || loadTokenFromFile();
 let getUpdatesBuf = "";
@@ -86,6 +88,25 @@ async function sendWechatText(target, text) {
   }
 }
 
+async function sendWechatFile(target, filePath) {
+  if (!botToken) {
+    throw new Error("WeChat iLink bot is not logged in");
+  }
+  if (!target || !target.toUserId) {
+    throw new Error("No WeChat target is available");
+  }
+  const result = await sendFileFromRuntime({
+    path: filePath,
+    botToken,
+    toUserId: target.toUserId,
+    contextToken: target.contextToken || "",
+    runtimeDir: RUNTIME_DIR,
+    ilinkClient
+  });
+  process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "out", media: result.type, to: shortId(target.toUserId), path: result.path, size: result.size })}\n`);
+  return result;
+}
+
 let inboundQueue;
 
 const adapter = createWxBotAdapter({
@@ -97,6 +118,9 @@ const adapter = createWxBotAdapter({
   },
   sendText: async (text) => {
     await sendWechatText(replyTarget || currentTarget, text);
+  },
+  sendFile: async (filePath) => {
+    return sendWechatFile(replyTarget || currentTarget, filePath);
   }
 });
 
@@ -178,6 +202,7 @@ async function main() {
             contextToken: message.context_token || ""
           };
           currentTarget = target;
+          saveLastTarget(target, RUNTIME_DIR);
 
           if (text) {
             process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "in", from: shortId(message.from_user_id), text })}\n`);
@@ -193,6 +218,13 @@ async function main() {
               replyTarget = previousReplyTarget;
             }
             continue;
+          }
+
+          if (inboundQueue.busy && inboundQueue.activeAgeMs() >= RECONCILE_MIN_BUSY_MS) {
+            const reconcile = await adapter.reconcileCurrentTurnState();
+            if (reconcile.checked) {
+              process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "queue", from: shortId(message.from_user_id), status: "reconciled", running: reconcile.running, turnStatus: reconcile.status || "" })}\n`);
+            }
           }
 
           let mediaResult = { saved: [], errors: [] };

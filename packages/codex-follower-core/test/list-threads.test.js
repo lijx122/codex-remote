@@ -68,6 +68,26 @@ try {
   assert.equal(listedIds.has(ids.subIndexedDb), false);
   assert.equal(listedIds.has(ids.subDbOnly), false);
   assert.equal(listedIds.has(ids.subBroadcast), false);
+
+  let interruptedTurn = null;
+  core.events.on("turn_interrupted", (event) => {
+    interruptedTurn = event;
+  });
+  core.handleBroadcast({
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId: ids.userBroadcast,
+      change: {
+        conversationState: {
+          title: "broadcast user",
+          turns: [
+            { turnId: "turn-canceled", status: "interrupted" }
+          ]
+        }
+      }
+    }
+  });
+  assert.equal(interruptedTurn && interruptedTurn.turnId, "turn-canceled");
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

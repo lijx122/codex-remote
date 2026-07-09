@@ -13,6 +13,15 @@ try {
 const { IpcTransport } = require("./ipc-transport");
 const { CodexFollowerEventBus } = require("./event-bus");
 
+const INTERRUPTED_TURN_STATUSES = new Set([
+  "interrupted",
+  "interrupt",
+  "canceled",
+  "cancelled",
+  "aborted",
+  "stopped"
+]);
+
 class CodexFollowerCore {
   constructor(options = {}) {
     this.transport = new IpcTransport(options);
@@ -692,6 +701,14 @@ class CodexFollowerCore {
         turnId: lastTurn.turnId,
         raw
       });
+    } else if (isInterruptedTurnStatus(status)) {
+      this.events.publish({
+        type: "turn_interrupted",
+        conversationId,
+        turnId: lastTurn.turnId,
+        status,
+        raw
+      });
     }
   }
 
@@ -742,6 +759,10 @@ function openThreadDeepLink(conversationId) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isInterruptedTurnStatus(status) {
+  return INTERRUPTED_TURN_STATUSES.has(String(status || "").toLowerCase());
 }
 
 function archivedIdsFromRows(rows) {

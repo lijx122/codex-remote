@@ -17,6 +17,7 @@ class WxBotAdapter {
     }
     this.client = options.client || new ControlPlaneClient({ baseUrl: options.controlPlaneUrl });
     this.sendText = options.sendText;
+    this.sendFile = typeof options.sendFile === "function" ? options.sendFile : null;
     this.maxMessageLength = options.maxMessageLength || 1500;
     this.maxThreads = options.maxThreads || 20;
     this.now = options.now || (() => Date.now());
@@ -57,6 +58,7 @@ class WxBotAdapter {
     if (command === "/stop") return this.commandStop();
     if (command === "/history") return this.commandHistory();
     if (command === "/help") return this.commandHelp();
+    if (command === "/sendfile") return this.commandSendFile(input.slice(command.length).trim());
     if (command === "/approve") return this.commandApprove(arg);
     if (command === "/y") return this.commandApprove("yes");
     if (command === "/n") return this.commandApprove("no");
@@ -185,6 +187,7 @@ class WxBotAdapter {
       "/where    查看当前会话",
       "/history  查看最近消息",
       "/stop     中断当前任务",
+      "/sendfile <路径>  发送本地文件到当前微信",
       "/help     查看帮助",
       "",
       "非 / 开头的消息会发送到当前会话。",
@@ -242,6 +245,8 @@ class WxBotAdapter {
 
     if (event.type === "turn_completed") {
       await this.handleTurnCompleted(event.payload || {});
+    } else if (event.type === "turn_interrupted" || event.type === "interrupt") {
+      await this.handleTurnInterrupted(event.payload || event);
     } else if (event.type === "approval_request") {
       await this.handleApprovalRequest(event);
     } else if (event.type === "error") {
@@ -262,6 +267,48 @@ class WxBotAdapter {
       command || JSON.stringify(raw),
       "",
       "回复 /y 批准，/n 拒绝"
+    ].join("\n"));
+  }
+
+  async reconcileCurrentTurnState() {
+    if (!this.currentConversationId || !this.onTurnSettled) return { checked: false };
+    try {
+      const history = await this.client.loadHistory(this.currentConversationId);
+      const state = history.state || history;
+      const latest = latestTurn(state);
+      const status = latest && latest.status ? String(latest.status) : "";
+      if (!latest || isRunningTurnStatus(status)) {
+        return { checked: true, running: true, status };
+      }
+      await this.onTurnSettled({
+        conversationId: this.currentConversationId,
+        turnId: latest.turnId || "",
+        reason: "reconcile",
+        status
+      });
+      return { checked: true, running: false, status };
+    } catch (error) {
+      this.logger.warn && this.logger.warn("Failed to reconcile turn state", errorMessage(error));
+      return { checked: false, error };
+    }
+  }
+
+  async commandSendFile(arg) {
+    if (!arg) {
+      await this.reply("用法：/sendfile <本地文件路径>");
+      return;
+    }
+    if (!this.sendFile) {
+      await this.reply("当前运行方式不支持发送本地文件");
+      return;
+    }
+    const result = await this.sendFile(arg);
+    await this.reply([
+      "已发送文件：",
+      result.fileName || arg,
+      "",
+      "大小：",
+      formatBytes(result.size)
     ].join("\n"));
   }
 
@@ -288,6 +335,16 @@ class WxBotAdapter {
     }
   }
 
+  async handleTurnInterrupted(payload) {
+    if (!this.onTurnSettled) return;
+    await this.onTurnSettled({
+      conversationId: this.currentConversationId,
+      turnId: payload.turnId || "",
+      reason: "interrupted",
+      status: payload.status || "interrupted"
+    });
+  }
+
   async requireConversation() {
     if (this.currentConversationId) return true;
     await this.reply("请先使用 /q <序号> 或 /ls 查看可用会话");
@@ -311,6 +368,23 @@ class WxBotAdapter {
 function formatLastActive(thread, now) {
   if (!thread || !thread.updatedAt) return "未知";
   return require("./message-utils").relativeTime(thread.updatedAt, now);
+}
+
+function formatBytes(size) {
+  const bytes = Number(size || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function latestTurn(state) {
+  const turns = state && Array.isArray(state.turns) ? state.turns : [];
+  return turns.length ? turns[turns.length - 1] : null;
+}
+
+function isRunningTurnStatus(status) {
+  const normalized = String(status || "").toLowerCase();
+  return normalized === "running" || normalized === "inprogress" || normalized === "in_progress";
 }
 
 function createWxBotAdapter(options) {

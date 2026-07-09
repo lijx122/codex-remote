@@ -28,6 +28,7 @@ class InboundMessageQueue {
     this.queue = [];
     this.busy = false;
     this.active = null;
+    this.activeSince = 0;
     this.settleTimer = null;
   }
 
@@ -136,6 +137,7 @@ class InboundMessageQueue {
     }
     this.busy = true;
     this.active = item;
+    this.activeSince = this.now();
     try {
       Promise.resolve(this.sendToCodex(item)).catch((error) => this.handleDispatchError(error, item));
     } catch (error) {
@@ -146,6 +148,7 @@ class InboundMessageQueue {
   handleDispatchError(error, item) {
     this.busy = false;
     this.active = null;
+    this.activeSince = 0;
     if (this.onDispatchError) this.onDispatchError(error, item);
     this.processNext();
   }
@@ -154,7 +157,12 @@ class InboundMessageQueue {
     if (!this.busy) return;
     this.busy = false;
     this.active = null;
+    this.activeSince = 0;
     this.scheduleProcessNext();
+  }
+
+  activeAgeMs() {
+    return this.busy && this.activeSince ? Math.max(0, this.now() - this.activeSince) : 0;
   }
 
   scheduleProcessNext() {
