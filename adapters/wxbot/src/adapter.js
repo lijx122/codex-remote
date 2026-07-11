@@ -1,5 +1,7 @@
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
 const { ControlPlaneClient } = require("./control-plane-client");
 const {
   errorMessage,
@@ -24,6 +26,7 @@ class WxBotAdapter {
     this.now = options.now || (() => Date.now());
     this.logger = options.logger || console;
     this.onTurnSettled = typeof options.onTurnSettled === "function" ? options.onTurnSettled : null;
+    this.stateFile = options.stateFile || "";
 
     this.currentConversationId = "";
     this.currentThread = null;
@@ -32,6 +35,7 @@ class WxBotAdapter {
     this.pendingApprovalId = "";
     this.socket = null;
     this.reconnectTimer = null;
+    this.restoreState();
   }
 
   async handleText(text) {
@@ -40,12 +44,12 @@ class WxBotAdapter {
 
     try {
       if (input.startsWith("/")) {
-        await this.handleCommand(input);
-        return;
+        return await this.handleCommand(input);
       }
-      await this.sendUserMessage(input);
+      return await this.sendUserMessage(input);
     } catch (error) {
       await this.reply(this.toUserError(error));
+      return { ok: false, sent: false, error };
     }
   }
 
@@ -115,6 +119,7 @@ class WxBotAdapter {
     }
 
     this.connectEvents();
+    this.saveState();
     const rawTitle = (this.currentThread && this.currentThread.title) || this.currentConversationId;
     const short = String(rawTitle).replace(/\r?\n/g, " ");
     const display = short.length > 40 ? short.slice(0, 40) + "…" : short;
@@ -197,7 +202,7 @@ class WxBotAdapter {
   }
 
   async sendUserMessage(message) {
-    if (!await this.requireConversation()) return;
+    if (!await this.requireConversation()) return { ok: false, sent: false, reason: "no_conversation" };
     await this.client.send(this.currentConversationId, message);
     const rawTitle = (this.currentThread && this.currentThread.title) || this.currentConversationId;
     const short = String(rawTitle).replace(/\r?\n/g, " ");
@@ -212,6 +217,7 @@ class WxBotAdapter {
       "运行中..."
     ].join("\n"));
     this.connectEvents();
+    return { ok: true, sent: true };
   }
 
   connectEvents() {
@@ -281,6 +287,14 @@ class WxBotAdapter {
       if (!latest || isRunningTurnStatus(status)) {
         return { checked: true, running: true, status };
       }
+      if (status === "completed") {
+        await this.handleTurnCompleted({
+          conversationId: this.currentConversationId,
+          turnId: latest.turnId || "",
+          reason: "reconcile"
+        });
+        return { checked: true, running: false, status };
+      }
       await this.onTurnSettled({
         conversationId: this.currentConversationId,
         turnId: latest.turnId || "",
@@ -314,9 +328,7 @@ class WxBotAdapter {
   }
 
   async handleTurnCompleted(payload) {
-    const turnId = payload.turnId || "";
-    if (turnId && turnId === this.lastCompletedTurnId) return;
-    if (turnId) this.lastCompletedTurnId = turnId;
+    const payloadTurnId = payload.turnId || "";
 
     try {
       const history = await this.client.loadHistory(this.currentConversationId);
@@ -324,6 +336,9 @@ class WxBotAdapter {
       const state = history.state || history;
       const latest = latestAssistantMessage(state);
       if (!latest || !latest.text) return;
+      const completionTurnId = latest.turnId || payloadTurnId;
+      if (completionTurnId && completionTurnId === this.lastCompletedTurnId) return;
+      if (completionTurnId) this.lastCompletedTurnId = completionTurnId;
 
       this.lastCompletedAssistantMessage = latest.text;
       await this.reply(latest.text);
@@ -331,7 +346,7 @@ class WxBotAdapter {
       this.logger.warn && this.logger.warn("Failed to load history for turn_completed", e);
     } finally {
       if (this.onTurnSettled) {
-        await this.onTurnSettled({ conversationId: this.currentConversationId, turnId });
+        await this.onTurnSettled({ conversationId: this.currentConversationId, turnId: payloadTurnId });
       }
     }
   }
@@ -350,6 +365,34 @@ class WxBotAdapter {
     if (this.currentConversationId) return true;
     await this.reply("请先使用 /q <序号> 或 /ls 查看可用会话");
     return false;
+  }
+
+  restoreState() {
+    if (!this.stateFile) return;
+    try {
+      const data = JSON.parse(fs.readFileSync(this.stateFile, "utf8"));
+      const conversationId = data.currentConversationId || "";
+      if (!conversationId) return;
+      this.currentConversationId = conversationId;
+      this.currentThread = data.currentThread || { conversationId, id: conversationId };
+      this.connectEvents();
+    } catch {
+      // No persisted selection yet.
+    }
+  }
+
+  saveState() {
+    if (!this.stateFile || !this.currentConversationId) return;
+    try {
+      fs.mkdirSync(path.dirname(this.stateFile), { recursive: true });
+      fs.writeFileSync(this.stateFile, JSON.stringify({
+        currentConversationId: this.currentConversationId,
+        currentThread: this.currentThread || null,
+        savedAt: new Date().toISOString()
+      }, null, 2), "utf8");
+    } catch (error) {
+      this.logger.warn && this.logger.warn("Failed to save wxbot state", errorMessage(error));
+    }
   }
 
   async reply(text) {

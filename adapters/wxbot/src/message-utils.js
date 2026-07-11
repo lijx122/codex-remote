@@ -90,7 +90,7 @@ function flattenHistory(state) {
           if (text) messages.push({ role: "User", text, turnId: turn.turnId || null });
         } else if (item.type === "agentMessage") {
           const text = item.text || "";
-          if (text) messages.push({ role: "Assistant", text, turnId: turn.turnId || null });
+          if (text) messages.push({ role: "Assistant", text, turnId: turn.turnId || null, phase: item.phase || null });
         }
       }
     }
@@ -119,7 +119,8 @@ function turnsFromState(state) {
 function latestAssistantMessage(state) {
   const messages = flattenHistory(state);
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index].role === "Assistant") return messages[index];
+    const message = messages[index];
+    if (message.role === "Assistant" && (message.phase === "final_answer" || !message.phase)) return message;
   }
   return null;
 }

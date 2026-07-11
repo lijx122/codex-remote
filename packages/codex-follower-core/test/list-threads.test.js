@@ -88,6 +88,32 @@ try {
     }
   });
   assert.equal(interruptedTurn && interruptedTurn.turnId, "turn-canceled");
+
+  let completedTurn = null;
+  core.events.on("turn_completed", (event) => {
+    completedTurn = event;
+  });
+  core.handleBroadcast({
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId: ids.userBroadcast,
+      change: {
+        conversationState: canonicalState("turn-completed", "completed")
+      }
+    }
+  });
+  assert.equal(completedTurn && completedTurn.turnId, "turn-completed");
+
+  appendRolloutMessages(tmp, ids.userIndexed, [
+    userResponse("new-turn", "new user"),
+    assistantResponse("new-turn", "new final")
+  ]);
+  let rolloutCompletedTurn = null;
+  core.events.on("turn_completed", (event) => {
+    rolloutCompletedTurn = event;
+  });
+  core.publishTurnEvents(ids.userIndexed, canonicalState("old-turn", "completed", { includeFinal: false }), {});
+  assert.equal(rolloutCompletedTurn && rolloutCompletedTurn.turnId, "new-turn");
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }
@@ -108,6 +134,34 @@ function writeRollout(root, id, meta) {
     JSON.stringify({ type: "session_meta", payload: { id, ...meta } }) + "\n",
     "utf8"
   );
+}
+
+function appendRolloutMessages(root, id, messages) {
+  const filePath = path.join(root, "sessions", "2026", "01", "01", `rollout-2026-01-01T00-00-00-${id}.jsonl`);
+  fs.appendFileSync(
+    filePath,
+    messages.map((payload) => JSON.stringify({ type: "response_item", payload })).join("\n") + "\n",
+    "utf8"
+  );
+}
+
+function userResponse(turnId, text) {
+  return {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text }],
+    internal_chat_message_metadata_passthrough: { turn_id: turnId }
+  };
+}
+
+function assistantResponse(turnId, text) {
+  return {
+    type: "message",
+    role: "assistant",
+    content: [{ type: "output_text", text }],
+    phase: "final_answer",
+    internal_chat_message_metadata_passthrough: { turn_id: turnId }
+  };
 }
 
 function writeStateDb(root, rows) {
@@ -135,4 +189,32 @@ function writeStateDb(root, rows) {
     });
   }
   db.close();
+}
+
+function canonicalState(turnId, status, options = {}) {
+  const includeFinal = options.includeFinal !== false;
+  const items = status === "completed" && includeFinal
+    ? [{
+      type: "agentMessage",
+      text: "broadcast final",
+      phase: "final_answer"
+    }]
+    : [];
+  return {
+    title: "broadcast user",
+    turns: [],
+    turnHistory: {
+      kind: "canonical",
+      history: {
+        entitiesByKey: {
+          [`turn:${turnId}`]: {
+            turnId,
+            turnStartedAtMs: 100,
+            status,
+            items
+          }
+        }
+      }
+    }
+  };
 }

@@ -71,13 +71,15 @@ class FakeClient {
   const replies = [];
   let settledCount = 0;
   const client = new FakeClient();
+  const stateFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "codex-wxbot-state-")), "wxbot-state.json");
   const adapter = createWxBotAdapter({
     client,
     now: () => Date.now(),
     sendText: async (text) => replies.push(text),
     sendFile: async (filePath) => ({ fileName: path.basename(filePath), size: 1234, path: filePath }),
     maxMessageLength: 80,
-    onTurnSettled: async () => { settledCount += 1; }
+    onTurnSettled: async () => { settledCount += 1; },
+    stateFile
   });
 
   await adapter.handleText("/list");
@@ -85,6 +87,14 @@ class FakeClient {
 
   await adapter.handleText("/q 019ee451");
   assert.equal(adapter.currentConversationId, "019ee451-eed0-7c21-b1a6-8e56d603e82b");
+  assert.equal(JSON.parse(fs.readFileSync(stateFile, "utf8")).currentConversationId, adapter.currentConversationId);
+
+  const restoredAdapter = createWxBotAdapter({
+    client,
+    sendText: async (text) => replies.push(text),
+    stateFile
+  });
+  assert.equal(restoredAdapter.currentConversationId, adapter.currentConversationId);
 
   await adapter.handleText("修复 bug");
   assert.equal(client.sent[0].message, "修复 bug");
@@ -119,6 +129,13 @@ class FakeClient {
   assert.equal(reconciled.running, false);
   assert.equal(reconciled.status, "completed");
   assert.equal(settledCount, 3);
+  assert.match(replies.at(-1), /已完成微信 Adapter MVP/);
+
+  const repliesBeforeDuplicateReconcile = replies.length;
+  reconciled = await adapter.reconcileCurrentTurnState();
+  assert.equal(reconciled.running, false);
+  assert.equal(reconciled.status, "completed");
+  assert.equal(replies.length, repliesBeforeDuplicateReconcile);
 
   client.loadHistory = async (conversationId) => ({
     conversationId,
@@ -126,10 +143,10 @@ class FakeClient {
   });
   reconciled = await adapter.reconcileCurrentTurnState();
   assert.equal(reconciled.running, true);
-  assert.equal(settledCount, 3);
+  assert.equal(settledCount, 4);
 
   await adapter.handleEvent({ type: "turn_interrupted", conversationId: adapter.currentConversationId, payload: { turnId: "t2", status: "interrupted" } });
-  assert.equal(settledCount, 4);
+  assert.equal(settledCount, 5);
 
   await adapter.handleText("/history");
   assert.match(replies.at(-1), /Summary/);
@@ -141,6 +158,16 @@ class FakeClient {
   assert.deepEqual(splitMessage("abc", 2), ["[1/2]\nab", "[2/2]\nc"]);
   assert.equal(summarizeAssistantMessage("## Summary\nhello\n\n## Next\nworld"), "hello");
   assert.equal(turnsFromState(canonicalState("completed", "done")).at(-1).status, "completed");
+  client.assistantText = "old final";
+  client.loadHistory = async (conversationId) => ({
+    conversationId,
+    state: canonicalStateWithMessages([
+      { type: "agentMessage", text: "new commentary", phase: "commentary" },
+      { type: "agentMessage", text: "new final", phase: "final_answer" }
+    ])
+  });
+  await adapter.handleEvent({ type: "turn_completed", conversationId: adapter.currentConversationId, payload: { turnId: "new-final-turn" } });
+  assert.match(replies.at(-1), /new final/);
 
   const mediaMessage = {
     message_type: 1,
@@ -429,5 +456,17 @@ function canonicalState(status, assistantText) {
         }
       }
     }
+  };
+}
+
+function canonicalStateWithMessages(items) {
+  return {
+    turns: [
+      {
+        turnId: "new-final-turn",
+        status: "completed",
+        items
+      }
+    ]
   };
 }

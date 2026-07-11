@@ -29,6 +29,7 @@ class CodexFollowerCore {
     this.threads = new Map();
     this.histories = new Map();
     this.pendingApprovals = new Map();
+    this.lastPublishedTurnEvents = new Map();
     this.connected = false;
     this.codexHome = options.codexHome || defaultCodexHome();
 
@@ -331,7 +332,10 @@ class CodexFollowerCore {
         "thread-follower-load-complete-history",
         { conversationId }
       );
-      const state = this.histories.get(conversationId) || this.loadLocalHistory(conversationId);
+      const state = this.mergeWithLocalHistory(
+        this.histories.get(conversationId),
+        this.loadLocalHistory(conversationId)
+      );
       return {
         conversationId,
         revision: response.result && response.result.revision,
@@ -362,6 +366,7 @@ class CodexFollowerCore {
     }
 
     const turns = [];
+    const turnsById = new Map();
     let meta = null;
     for (const line of raw.split(/\r?\n/)) {
       if (!line.trim()) continue;
@@ -376,15 +381,34 @@ class CodexFollowerCore {
         meta = item.payload || meta;
         continue;
       }
+      if (item.type === "event_msg" && item.payload) {
+        const payload = item.payload;
+        const turnId = payload.turn_id || payload.turnId;
+        if (!turnId) continue;
+        const turn = ensureLocalTurn(turns, turnsById, turnId, item.timestamp);
+        if (payload.type === "task_started") {
+          turn.status = "running";
+        } else if (payload.type === "task_complete") {
+          turn.status = "completed";
+        } else if (payload.type === "turn_aborted") {
+          turn.status = "interrupted";
+        }
+        continue;
+      }
       if (item.type !== "response_item" || !item.payload) continue;
 
       const message = this.messageFromResponseItem(item.payload);
       if (!message) continue;
-      turns.push({
-        turnId: `${conversationId}-${turns.length}`,
-        status: "completed",
-        items: [message]
-      });
+      const turnId = message.turnId || `${conversationId}-${turns.length}`;
+      const turn = ensureLocalTurn(turns, turnsById, turnId, item.timestamp);
+      turn.items.push(message);
+      if (message.type === "agentMessage" && message.text && (message.phase === "final_answer" || !message.phase)) {
+        turn.status = "completed";
+      }
+    }
+
+    for (const turn of turns) {
+      if (!turn.status) turn.status = hasFinalAssistant(turn) ? "completed" : "completed";
     }
 
     const state = {
@@ -408,15 +432,21 @@ class CodexFollowerCore {
 
     const text = this.textFromResponseContent(payload.content);
     if (!text || text.startsWith("<environment_context>")) return null;
+    const turnId = payload.internal_chat_message_metadata_passthrough
+      && payload.internal_chat_message_metadata_passthrough.turn_id
+      ? payload.internal_chat_message_metadata_passthrough.turn_id
+      : null;
 
     if (payload.role === "user") {
       return {
         type: "userMessage",
+        turnId,
         content: [{ type: "text", text }]
       };
     }
     return {
       type: "agentMessage",
+      turnId,
       text,
       phase: payload.phase || null
     };
@@ -679,37 +709,74 @@ class CodexFollowerCore {
   }
 
   publishTurnEvents(conversationId, state, raw) {
-    if (!conversationId || !state || !Array.isArray(state.turns)) {
+    if (!conversationId || !state) {
       return;
     }
-    const lastTurn = state.turns[state.turns.length - 1];
-    if (!lastTurn) return;
+    const broadcastTurns = turnsFromState(state);
+    const broadcastLastTurn = broadcastTurns[broadcastTurns.length - 1] || null;
+    const broadcastStatus = broadcastLastTurn ? (broadcastLastTurn.status || "") : "";
 
-    const status = lastTurn.status || "";
-
-    if (status === "running" || status === "inProgress") {
-      this.events.publish({
+    if (broadcastStatus === "running" || broadcastStatus === "inProgress") {
+      this.publishTurnEventOnce(conversationId, "turn_started", broadcastLastTurn, broadcastStatus, raw, {
         type: "turn_started",
-        conversationId,
-        turnId: lastTurn.turnId,
         raw
       });
-    } else if (status === "completed") {
-      this.events.publish({
+      return;
+    }
+
+    if (broadcastStatus === "completed" && hasFinalAssistant(broadcastLastTurn)) {
+      this.publishTurnEventOnce(conversationId, "turn_completed", broadcastLastTurn, "completed", raw, {
         type: "turn_completed",
-        conversationId,
-        turnId: lastTurn.turnId,
         raw
       });
-    } else if (isInterruptedTurnStatus(status)) {
-      this.events.publish({
+      return;
+    }
+
+    const localState = this.mergeWithLocalHistory(state, this.loadLocalHistory(conversationId));
+    const localCompletedTurn = latestLocalFinalTurn(localState);
+    if (localCompletedTurn) {
+      this.publishTurnEventOnce(conversationId, "turn_completed", localCompletedTurn, "completed", raw, {
+        type: "turn_completed",
+        raw
+      });
+      return;
+    }
+
+    if (isInterruptedTurnStatus(broadcastStatus)) {
+      this.publishTurnEventOnce(conversationId, "turn_interrupted", broadcastLastTurn, broadcastStatus, raw, {
         type: "turn_interrupted",
-        conversationId,
-        turnId: lastTurn.turnId,
-        status,
+        status: broadcastStatus,
         raw
       });
     }
+  }
+
+  publishTurnEventOnce(conversationId, eventType, turn, status, raw, event) {
+    if (!turn || !turn.turnId) return;
+    const key = `${eventType}:${turn.turnId}:${status || ""}`;
+    if (this.lastPublishedTurnEvents.get(conversationId) === key) return;
+    this.lastPublishedTurnEvents.set(conversationId, key);
+    this.events.publish({
+      ...event,
+      conversationId,
+      turnId: turn.turnId,
+      raw
+    });
+  }
+
+  mergeWithLocalHistory(liveState, localState) {
+    if (!localState || !Array.isArray(localState.turns) || localState.turns.length === 0) {
+      return liveState || localState;
+    }
+    if (!liveState) return localState;
+    return {
+      ...liveState,
+      turns: localState.turns,
+      turnHistory: null,
+      source: "merged-rollout",
+      rolloutPath: localState.rolloutPath,
+      revision: localState.revision
+    };
   }
 
   assertConversationId(conversationId) {
@@ -763,6 +830,56 @@ function sleep(ms) {
 
 function isInterruptedTurnStatus(status) {
   return INTERRUPTED_TURN_STATUSES.has(String(status || "").toLowerCase());
+}
+
+function turnsFromState(state) {
+  if (!state || typeof state !== "object") return [];
+
+  const entities = state.turnHistory && state.turnHistory.history && state.turnHistory.history.entitiesByKey;
+  if (!entities || typeof entities !== "object") return Array.isArray(state.turns) ? state.turns : [];
+
+  const canonicalTurns = Object.entries(entities)
+    .filter(([key, value]) => key.startsWith("turn:") && value && typeof value === "object")
+    .map(([, value]) => value)
+    .sort((a, b) => {
+      const aStarted = Number(a.turnStartedAtMs || 0);
+      const bStarted = Number(b.turnStartedAtMs || 0);
+      if (aStarted !== bStarted) return aStarted - bStarted;
+      return String(a.turnId || "").localeCompare(String(b.turnId || ""));
+    });
+  return canonicalTurns.length > 0 ? canonicalTurns : (Array.isArray(state.turns) ? state.turns : []);
+}
+
+function latestLocalFinalTurn(state) {
+  const turns = turnsFromState(state);
+  if (turns.length === 0) return null;
+  const latest = turns[turns.length - 1];
+  if (!latest || latest.status !== "completed") return null;
+  return hasFinalAssistant(latest) ? latest : null;
+}
+
+function ensureLocalTurn(turns, turnsById, turnId, timestamp) {
+  if (turnsById.has(turnId)) return turnsById.get(turnId);
+  const startedMs = Date.parse(timestamp || "");
+  const turn = {
+    turnId,
+    status: "",
+    turnStartedAtMs: Number.isFinite(startedMs) ? startedMs : 0,
+    items: []
+  };
+  turnsById.set(turnId, turn);
+  turns.push(turn);
+  return turn;
+}
+
+function hasFinalAssistant(turn) {
+  if (!turn) return false;
+  return (turn.items || []).some((item) =>
+    item
+    && item.type === "agentMessage"
+    && item.text
+    && (item.phase === "final_answer" || !item.phase)
+  );
 }
 
 function archivedIdsFromRows(rows) {

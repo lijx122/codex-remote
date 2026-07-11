@@ -30,14 +30,17 @@ const controlPlaneUrl = process.env.CODEX_CONTROL_PLANE_URL || "http://127.0.0.1
 
 const RUNTIME_DIR = process.env.CODEX_REMOTE_RUNTIME_DIR || path.resolve(__dirname, "..", ".runtime");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "ilink-bot-token.json");
+const WXBOT_STATE_FILE = path.join(RUNTIME_DIR, "wxbot-state.json");
 const MEDIA_DIR = path.join(RUNTIME_DIR, "media");
 const RECONCILE_MIN_BUSY_MS = Number(process.env.WXBOT_RECONCILE_MIN_BUSY_MS || 2000);
+const RECONCILE_INTERVAL_MS = Number(process.env.WXBOT_RECONCILE_INTERVAL_MS || 3000);
 
 let botToken = process.env.ILINK_BOT_TOKEN || loadTokenFromFile();
 let getUpdatesBuf = "";
 let currentTarget = null;
 let replyTarget = null;
 let stopping = false;
+let reconcileInFlight = false;
 
 function loadTokenFromFile() {
   try {
@@ -111,6 +114,7 @@ let inboundQueue;
 
 const adapter = createWxBotAdapter({
   controlPlaneUrl,
+  stateFile: WXBOT_STATE_FILE,
   onTurnSettled: () => {
     if (!inboundQueue) return;
     inboundQueue.markSettled();
@@ -133,12 +137,21 @@ inboundQueue = new InboundMessageQueue({
   pendingTtlMs: Number(process.env.WXBOT_PENDING_TTL_MS || 30 * 60 * 1000),
   sendToCodex: async (item) => {
     replyTarget = item.target;
-    await adapter.handleText(item.payload);
+    const result = await adapter.handleText(item.payload);
+    if (result && result.sent === false && inboundQueue) {
+      inboundQueue.markSettled();
+    }
   },
   onDispatchError: (error, item) => {
     process.stderr.write(`codex dispatch failed: ${JSON.stringify({ to: shortId(item.target && item.target.toUserId), error: error.message || String(error) })}\n`);
   }
 });
+
+setInterval(() => {
+  reconcileQueue("timer").catch((error) => {
+    process.stderr.write(`queue reconcile failed: ${error.message || error}\n`);
+  });
+}, RECONCILE_INTERVAL_MS);
 
 main().catch((error) => {
   process.stderr.write(`${error.stack || error}\n`);
@@ -220,12 +233,7 @@ async function main() {
             continue;
           }
 
-          if (inboundQueue.busy && inboundQueue.activeAgeMs() >= RECONCILE_MIN_BUSY_MS) {
-            const reconcile = await adapter.reconcileCurrentTurnState();
-            if (reconcile.checked) {
-              process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "queue", from: shortId(message.from_user_id), status: "reconciled", running: reconcile.running, turnStatus: reconcile.status || "" })}\n`);
-            }
-          }
+          await reconcileQueue("inbound", message.from_user_id);
 
           let mediaResult = { saved: [], errors: [] };
           if (media.length > 0) {
@@ -251,6 +259,21 @@ async function main() {
         await sleep(3000);
       }
     }
+  }
+}
+
+async function reconcileQueue(reason, fromUserId = "") {
+  if (!inboundQueue || !inboundQueue.busy) return;
+  if (inboundQueue.activeAgeMs() < RECONCILE_MIN_BUSY_MS) return;
+  if (reconcileInFlight) return;
+  reconcileInFlight = true;
+  try {
+    const reconcile = await adapter.reconcileCurrentTurnState();
+    if (reconcile.checked) {
+      process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "queue", from: shortId(fromUserId), status: "reconciled", reason, running: reconcile.running, turnStatus: reconcile.status || "" })}\n`);
+    }
+  } finally {
+    reconcileInFlight = false;
   }
 }
 
