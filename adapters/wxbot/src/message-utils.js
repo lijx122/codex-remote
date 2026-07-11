@@ -82,7 +82,7 @@ function flattenHistory(state) {
     }
   } else {
     // Old deeply nested format
-    const turns = state && Array.isArray(state.turns) ? state.turns : [];
+    const turns = turnsFromState(state);
     for (const turn of turns) {
       for (const item of turn.items || []) {
         if (item.type === "userMessage") {
@@ -96,6 +96,24 @@ function flattenHistory(state) {
     }
   }
   return messages;
+}
+
+function turnsFromState(state) {
+  if (!state || typeof state !== "object") return [];
+
+  const entities = state.turnHistory && state.turnHistory.history && state.turnHistory.history.entitiesByKey;
+  if (!entities || typeof entities !== "object") return Array.isArray(state.turns) ? state.turns : [];
+
+  const canonicalTurns = Object.entries(entities)
+    .filter(([key, value]) => key.startsWith("turn:") && value && typeof value === "object")
+    .map(([, value]) => value)
+    .sort((a, b) => {
+      const aStarted = Number(a.turnStartedAtMs || 0);
+      const bStarted = Number(b.turnStartedAtMs || 0);
+      if (aStarted !== bStarted) return aStarted - bStarted;
+      return String(a.turnId || "").localeCompare(String(b.turnId || ""));
+    });
+  return canonicalTurns.length > 0 ? canonicalTurns : (Array.isArray(state.turns) ? state.turns : []);
 }
 
 function latestAssistantMessage(state) {
@@ -193,5 +211,6 @@ module.exports = {
   latestAssistantMessage,
   relativeTime,
   splitMessage,
-  summarizeAssistantMessage
+  summarizeAssistantMessage,
+  turnsFromState
 };

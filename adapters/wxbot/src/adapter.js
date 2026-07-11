@@ -7,7 +7,8 @@ const {
   formatThread,
   historyText,
   latestAssistantMessage,
-  splitMessage
+  splitMessage,
+  turnsFromState
 } = require("./message-utils");
 
 class WxBotAdapter {
@@ -378,7 +379,7 @@ function formatBytes(size) {
 }
 
 function latestTurn(state) {
-  const turns = state && Array.isArray(state.turns) ? state.turns : [];
+  const turns = turnsFromState(state);
   return turns.length ? turns[turns.length - 1] : null;
 }
 

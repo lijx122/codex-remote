@@ -9,7 +9,7 @@ const path = require("node:path");
 const { createWxBotAdapter } = require("../src");
 const { InboundMessageQueue } = require("../src/inbound-queue");
 const { extractMediaItems, downloadMediaItems, ILinkClient, parseAesKey } = require("../src/ilink-client");
-const { splitMessage, summarizeAssistantMessage } = require("../src/message-utils");
+const { splitMessage, summarizeAssistantMessage, turnsFromState } = require("../src/message-utils");
 
 class FakeClient {
   constructor() {
@@ -111,8 +111,25 @@ class FakeClient {
   assert.equal(reconciled.running, false);
   assert.equal(settledCount, 2);
 
-  await adapter.handleEvent({ type: "turn_interrupted", conversationId: adapter.currentConversationId, payload: { turnId: "t2", status: "interrupted" } });
+  client.loadHistory = async (conversationId) => ({
+    conversationId,
+    state: canonicalState("completed", client.assistantText)
+  });
+  reconciled = await adapter.reconcileCurrentTurnState();
+  assert.equal(reconciled.running, false);
+  assert.equal(reconciled.status, "completed");
   assert.equal(settledCount, 3);
+
+  client.loadHistory = async (conversationId) => ({
+    conversationId,
+    state: canonicalState("running", client.assistantText)
+  });
+  reconciled = await adapter.reconcileCurrentTurnState();
+  assert.equal(reconciled.running, true);
+  assert.equal(settledCount, 3);
+
+  await adapter.handleEvent({ type: "turn_interrupted", conversationId: adapter.currentConversationId, payload: { turnId: "t2", status: "interrupted" } });
+  assert.equal(settledCount, 4);
 
   await adapter.handleText("/history");
   assert.match(replies.at(-1), /Summary/);
@@ -123,6 +140,7 @@ class FakeClient {
 
   assert.deepEqual(splitMessage("abc", 2), ["[1/2]\nab", "[2/2]\nc"]);
   assert.equal(summarizeAssistantMessage("## Summary\nhello\n\n## Next\nworld"), "hello");
+  assert.equal(turnsFromState(canonicalState("completed", "done")).at(-1).status, "completed");
 
   const mediaMessage = {
     message_type: 1,
@@ -391,3 +409,25 @@ class FakeClient {
   process.stderr.write(`${error.stack || error}\n`);
   process.exit(1);
 });
+
+function canonicalState(status, assistantText) {
+  return {
+    turns: [],
+    turnHistory: {
+      kind: "canonical",
+      history: {
+        entitiesByKey: {
+          "turn:t1": {
+            turnId: "t1",
+            turnStartedAtMs: 100,
+            status,
+            items: [
+              { type: "userMessage", content: [{ type: "text", text: "hello" }] },
+              { type: "agentMessage", text: assistantText }
+            ]
+          }
+        }
+      }
+    }
+  };
+}
