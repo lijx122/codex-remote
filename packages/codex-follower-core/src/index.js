@@ -536,9 +536,13 @@ class CodexFollowerCore {
         this.transport.off("broadcast", onBroadcast);
         resolve(result);
       };
-      this.transport.reconnect().catch((error) => {
-        stopWaiting({ ok: false, error: error.message });
-      });
+      this.transport.reconnect()
+        .then(() => {
+          this.connected = true;
+        })
+        .catch((error) => {
+          stopWaiting({ ok: false, error: error.message });
+        });
     });
     if (!this.threads.has(conversationId)) {
       return { ...broadcastResult, conversationId, sendable: false };
@@ -837,6 +841,10 @@ class CodexFollowerCore {
     if (this.resyncPromise) return;
     this.resyncPromise = Promise.resolve()
       .then(() => this.transport.reconnect())
+      .then((result) => {
+        this.connected = true;
+        return result;
+      })
       .catch((error) => this.publishDiagnostic("stream-resync-failed", conversationId, null, error))
       .finally(() => {
         this.resyncPromise = null;

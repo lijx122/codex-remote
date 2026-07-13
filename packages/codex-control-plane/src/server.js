@@ -36,6 +36,9 @@ function createControlPlaneServer(options = {}) {
   let connecting = null;
 
   if (core.transport && typeof core.transport.on === "function") {
+    core.transport.on("connect", () => {
+      connected = true;
+    });
     core.transport.on("close", () => {
       connected = false;
     });

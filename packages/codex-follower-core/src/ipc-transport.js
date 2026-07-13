@@ -92,6 +92,7 @@ class IpcTransport extends EventEmitter {
 
       socket.once("connect", () => {
         this.trace("connect", { type: "connection", pipePath: this.pipePath });
+        this.emit("connect");
         resolve();
       });
       socket.once("error", reject);
