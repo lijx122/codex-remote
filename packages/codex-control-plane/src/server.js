@@ -17,6 +17,7 @@ const EVENT_TYPES = new Set([
   "approval_response",
   "interrupt",
   "thread_state_changed",
+  "diagnostic",
   "error"
 ]);
 
@@ -34,6 +35,12 @@ function createControlPlaneServer(options = {}) {
   let connected = false;
   let connecting = null;
 
+  if (core.transport && typeof core.transport.on === "function") {
+    core.transport.on("close", () => {
+      connected = false;
+    });
+  }
+
   function logCommand(name, detail) {
     console.log(JSON.stringify({
       ts: new Date().toISOString(),
@@ -44,7 +51,7 @@ function createControlPlaneServer(options = {}) {
   }
 
   async function ensureConnected() {
-    if (connected) return;
+    if (connected && core.connected) return;
     if (!connecting) {
       connecting = core.connect()
         .then(async () => {

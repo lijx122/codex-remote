@@ -125,6 +125,32 @@ function latestAssistantMessage(state) {
   return null;
 }
 
+function latestAssistantMessageForTurn(state, turnId) {
+  const expectedTurnId = String(turnId || "");
+  if (!expectedTurnId) return latestAssistantMessage(state);
+
+  const turn = turnsFromState(state).find(
+    (candidate) => String(candidate && candidate.turnId || "") === expectedTurnId
+  );
+  if (!turn) return null;
+
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  let fallback = null;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!item || item.type !== "agentMessage" || !item.text) continue;
+    const message = {
+      role: "Assistant",
+      text: item.text,
+      turnId: expectedTurnId,
+      phase: item.phase || null
+    };
+    if (!fallback) fallback = message;
+    if (item.phase === "final_answer") return message;
+  }
+  return fallback;
+}
+
 function summarizeAssistantMessage(text, maxLen = 500) {
   const value = String(text || "").trim();
   if (!value) return "无最终回复内容";
@@ -210,6 +236,7 @@ module.exports = {
   formatThread,
   historyText,
   latestAssistantMessage,
+  latestAssistantMessageForTurn,
   relativeTime,
   splitMessage,
   summarizeAssistantMessage,

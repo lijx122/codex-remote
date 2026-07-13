@@ -1,11 +1,11 @@
 {
   "name": "codex-remote",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "bin": "app.js",
   "scripts": {
     "start": "node app.js",
-    "test": "node packages/codex-follower-core/test/list-threads.test.js && node packages/codex-control-plane/test/send-retry.test.js",
+    "test": "node packages/codex-follower-core/test/list-threads.test.js && node packages/codex-follower-core/test/send-warm.test.js && node packages/codex-control-plane/test/send-retry.test.js",
     "build": "pkg app.js --targets node18-win-x64 --output CodexRemote.exe"
   },
   "pkg": {

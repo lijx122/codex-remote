@@ -14,6 +14,9 @@ if (!fs.existsSync(runtimeDir)) {
   fs.mkdirSync(runtimeDir, { recursive: true });
 }
 process.env.CODEX_REMOTE_RUNTIME_DIR = runtimeDir;
+if (process.env.CODEX_IPC_TRACE === undefined) {
+  process.env.CODEX_IPC_TRACE = "1";
+}
 
 console.log("Codex Remote starting...");
 console.log(`Web UI: http://127.0.0.1:${process.env.CODEX_CONTROL_PLANE_PORT || 8787}`);

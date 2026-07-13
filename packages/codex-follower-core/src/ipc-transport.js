@@ -1,6 +1,7 @@
 "use strict";
 
 const net = require("node:net");
+const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { randomUUID } = require("node:crypto");
@@ -11,7 +12,7 @@ const DEFAULT_CLIENT_TYPE = "codex-follower-core";
 const DEFAULT_TIMEOUT_MS = 12000;
 
 const METHOD_VERSIONS = {
-  "thread-stream-state-changed": 7,
+  "thread-stream-state-changed": 11,
   "thread-read-state-changed": 1,
   "thread-archived": 2,
   "thread-unarchived": 1,
@@ -21,7 +22,7 @@ const METHOD_VERSIONS = {
   "thread-follower-steer-turn": 1,
   "thread-follower-interrupt-turn": 2,
   "thread-follower-update-thread-settings": 1,
-  "thread-follower-edit-last-user-turn": 1,
+  "thread-follower-edit-last-user-turn": 2,
   "thread-follower-command-approval-decision": 1,
   "thread-follower-file-approval-decision": 1,
   "thread-follower-permissions-request-approval-response": 1,
@@ -72,6 +73,12 @@ class IpcTransport extends EventEmitter {
     this.socket = null;
     this.pendingBuffer = Buffer.alloc(0);
     this.pendingRequests = new Map();
+    this.traceEnabled = options.trace === true || process.env.CODEX_IPC_TRACE === "1";
+    this.traceFile = options.traceFile
+      || process.env.CODEX_IPC_TRACE_FILE
+      || (this.traceEnabled && process.env.CODEX_REMOTE_RUNTIME_DIR
+        ? path.join(process.env.CODEX_REMOTE_RUNTIME_DIR, "codex-ipc-trace.jsonl")
+        : null);
   }
 
   async connect() {
@@ -83,10 +90,14 @@ class IpcTransport extends EventEmitter {
       const socket = net.createConnection(this.pipePath);
       this.socket = socket;
 
-      socket.once("connect", resolve);
+      socket.once("connect", () => {
+        this.trace("connect", { type: "connection", pipePath: this.pipePath });
+        resolve();
+      });
       socket.once("error", reject);
       socket.on("data", (chunk) => this.handleData(chunk));
       socket.on("close", () => {
+        this.trace("close", { pending: this.pendingRequests.size });
         this.socket = null;
         this.rejectPending(new Error("codex IPC connection closed"));
         this.emit("close");
@@ -111,6 +122,23 @@ class IpcTransport extends EventEmitter {
     }
   }
 
+  async reconnect() {
+    const socket = this.socket;
+    if (socket) {
+      await new Promise((resolve) => {
+        if (socket.destroyed) {
+          resolve();
+          return;
+        }
+        socket.once("close", resolve);
+        socket.destroy();
+      });
+    }
+    this.clientId = INITIAL_CLIENT_ID;
+    this.pendingBuffer = Buffer.alloc(0);
+    return this.connect();
+  }
+
   async request(method, params = {}, options = {}) {
     if (!this.socket) {
       throw new Error("codex IPC is not connected");
@@ -130,6 +158,8 @@ class IpcTransport extends EventEmitter {
       message.targetClientId = options.targetClientId;
     }
 
+    this.trace("request.send", message);
+
     const timeoutMs = options.timeoutMs || this.timeoutMs;
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -145,6 +175,30 @@ class IpcTransport extends EventEmitter {
     return promise;
   }
 
+  send(method, params = {}, options = {}) {
+    if (!this.socket) {
+      throw new Error("codex IPC is not connected");
+    }
+
+    const message = {
+      type: "request",
+      requestId: randomUUID(),
+      sourceClientId: options.sourceClientId || this.clientId,
+      version: options.version ?? METHOD_VERSIONS[method] ?? 0,
+      method,
+      params
+    };
+
+    if (options.targetClientId) {
+      message.targetClientId = options.targetClientId;
+    }
+
+    this.trace("send", message);
+    this.socket.write(encodeFrame(message));
+    this.emit("send", message);
+    return { accepted: true, requestId: message.requestId, method };
+  }
+
   handleData(chunk) {
     try {
       this.pendingBuffer = decodeFrames(
@@ -157,6 +211,7 @@ class IpcTransport extends EventEmitter {
   }
 
   handleMessage(message) {
+    this.trace("receive", message);
     this.emit("message", message);
 
     if (message.type === "client-discovery-request") {
@@ -191,9 +246,29 @@ class IpcTransport extends EventEmitter {
       response: { canHandle: false }
     };
     if (this.socket) {
+      this.trace("discovery.response", response);
       this.socket.write(encodeFrame(response));
       this.emit("send", response);
     }
+  }
+
+  trace(kind, message) {
+    if (!this.traceEnabled) return;
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      layer: "ipc-transport",
+      kind,
+      ...summarizeIpcMessage(message)
+    }) + "\n";
+    if (this.traceFile) {
+      try {
+        fs.mkdirSync(path.dirname(this.traceFile), { recursive: true });
+        fs.appendFileSync(this.traceFile, line, "utf8");
+      } catch {
+        // Runtime tracing must never affect the IPC path.
+      }
+    }
+    console.error(line.trim());
   }
 
   respondToServer(requestId, result) {
@@ -217,6 +292,32 @@ class IpcTransport extends EventEmitter {
     }
     this.pendingRequests.clear();
   }
+}
+
+function summarizeIpcMessage(message) {
+  if (!message || typeof message !== "object") return { valueType: typeof message };
+  const summary = {
+    type: message.type || null,
+    method: message.method || null,
+    version: Number.isInteger(message.version) ? message.version : null,
+    requestId: message.requestId || null,
+    resultType: message.resultType || null,
+    error: message.error ? String(message.error).slice(0, 240) : undefined
+  };
+  if (message.params && typeof message.params === "object") {
+    summary.paramKeys = Object.keys(message.params).sort();
+    if (message.params.turnStartParams && typeof message.params.turnStartParams === "object") {
+      summary.turnStartParamKeys = Object.keys(message.params.turnStartParams).sort();
+      summary.inputCount = Array.isArray(message.params.turnStartParams.input)
+        ? message.params.turnStartParams.input.length
+        : undefined;
+    }
+  }
+  if (message.request && typeof message.request === "object") {
+    summary.requestMethod = message.request.method || null;
+    summary.requestVersion = Number.isInteger(message.request.version) ? message.request.version : null;
+  }
+  return summary;
 }
 
 module.exports = { IpcTransport, METHOD_VERSIONS, defaultPipePath };

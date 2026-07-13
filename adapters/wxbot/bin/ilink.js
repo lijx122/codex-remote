@@ -30,17 +30,101 @@ const controlPlaneUrl = process.env.CODEX_CONTROL_PLANE_URL || "http://127.0.0.1
 
 const RUNTIME_DIR = process.env.CODEX_REMOTE_RUNTIME_DIR || path.resolve(__dirname, "..", ".runtime");
 const TOKEN_FILE = path.join(RUNTIME_DIR, "ilink-bot-token.json");
+const UPDATES_STATE_FILE = path.join(RUNTIME_DIR, "ilink-updates-state.json");
 const WXBOT_STATE_FILE = path.join(RUNTIME_DIR, "wxbot-state.json");
+const WXBOT_RUNTIME_LOG_FILE = path.join(RUNTIME_DIR, "wxbot-runtime.jsonl");
 const MEDIA_DIR = path.join(RUNTIME_DIR, "media");
 const RECONCILE_MIN_BUSY_MS = Number(process.env.WXBOT_RECONCILE_MIN_BUSY_MS || 2000);
 const RECONCILE_INTERVAL_MS = Number(process.env.WXBOT_RECONCILE_INTERVAL_MS || 3000);
 
 let botToken = process.env.ILINK_BOT_TOKEN || loadTokenFromFile();
-let getUpdatesBuf = "";
+let getUpdatesBuf = loadUpdatesCursor();
 let currentTarget = null;
 let replyTarget = null;
 let stopping = false;
 let reconcileInFlight = false;
+const processedInboundMessages = new Map();
+const INBOUND_DEDUP_TTL_MS = 30 * 60 * 1000;
+const INBOUND_DEDUP_MAX = 2000;
+
+const runtimeLogger = {
+  info: (...args) => writeAdapterLog("info", args),
+  warn: (...args) => writeAdapterLog("warn", args),
+  error: (...args) => writeAdapterLog("error", args)
+};
+
+function writeRuntimeEvent(event, stream = process.stdout) {
+  const entry = normalizeRuntimeEvent(event);
+  const line = `${JSON.stringify(entry)}\n`;
+  stream.write(line);
+  try {
+    fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+    fs.appendFileSync(WXBOT_RUNTIME_LOG_FILE, line, "utf8");
+  } catch (error) {
+    process.stderr.write(`${JSON.stringify({
+      ts: new Date().toISOString(),
+      direction: "runtime",
+      status: "log_write_failed",
+      error: errorSummary(error)
+    })}\n`);
+  }
+}
+
+function normalizeRuntimeEvent(event) {
+  const source = event && typeof event === "object" ? event : {};
+  const normalized = { ts: source.ts || new Date().toISOString() };
+  const stringFields = ["direction", "source", "level", "turnId", "phase", "status", "reason", "turnStatus"];
+  const numericFields = ["length", "count", "held", "queued"];
+  const booleanFields = ["busy", "running"];
+
+  for (const key of stringFields) {
+    if (source[key] !== undefined && source[key] !== null && source[key] !== "") {
+      normalized[key] = String(source[key]).slice(0, 240);
+    }
+  }
+  for (const key of ["from", "to", "conversationId"]) {
+    if (source[key]) normalized[key] = shortId(source[key]);
+  }
+  for (const key of numericFields) {
+    if (Number.isFinite(Number(source[key]))) normalized[key] = Number(source[key]);
+  }
+  for (const key of booleanFields) {
+    if (typeof source[key] === "boolean") normalized[key] = source[key];
+  }
+  if (source.media) {
+    normalized.media = Array.isArray(source.media)
+      ? source.media.map((value) => String(value).slice(0, 40)).slice(0, 10)
+      : String(source.media).slice(0, 80);
+  }
+  if (source.error) normalized.error = errorSummary(source.error);
+  return normalized;
+}
+
+function writeAdapterLog(level, args) {
+  const event = { direction: "adapter", level, status: "log" };
+  const summaries = [];
+  for (const arg of args) {
+    if (arg && typeof arg === "object" && !(arg instanceof Error)) {
+      for (const key of ["conversationId", "turnId", "phase", "length", "status", "error"]) {
+        if (arg[key] !== undefined) event[key] = arg[key];
+      }
+    } else if (arg !== undefined) {
+      summaries.push(errorSummary(arg));
+    }
+  }
+  if (!event.error && summaries.length > 0) event.error = summaries.join(" | ");
+  writeRuntimeEvent(event, level === "error" ? process.stderr : process.stdout);
+}
+
+function errorSummary(value) {
+  const raw = value && value.message ? value.message : String(value || "unknown error");
+  return raw
+    .replace(/\r?\n/g, " ")
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/(bot[_-]?token|context[_-]?token|authorization)(?:\s*[:=]\s*|\s+)\S+/gi, "$1=[redacted]")
+    .replace(/\b(wxid_[A-Za-z0-9_-]{8})[A-Za-z0-9_-]*/g, "$1...")
+    .slice(0, 240);
+}
 
 function loadTokenFromFile() {
   try {
@@ -57,6 +141,27 @@ function loadTokenFromFile() {
   return "";
 }
 
+function loadUpdatesCursor() {
+  try {
+    const data = JSON.parse(fs.readFileSync(UPDATES_STATE_FILE, "utf8"));
+    return String(data.getUpdatesBuf || data.syncBuf || "");
+  } catch {
+    return "";
+  }
+}
+
+function saveUpdatesCursor(cursor) {
+  try {
+    fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+    fs.writeFileSync(UPDATES_STATE_FILE, JSON.stringify({
+      getUpdatesBuf: cursor,
+      savedAt: new Date().toISOString()
+    }, null, 2), "utf8");
+  } catch (error) {
+    writeRuntimeEvent({ direction: "runtime", status: "updates_cursor_save_failed", error }, process.stderr);
+  }
+}
+
 function saveTokenToFile(token) {
   try {
     fs.mkdirSync(RUNTIME_DIR, { recursive: true });
@@ -69,20 +174,20 @@ function saveTokenToFile(token) {
 
 async function sendWechatText(target, text) {
   if (!botToken) {
-    process.stdout.write(`[WX OUT skipped: not logged in]\n${text}\n`);
+    writeRuntimeEvent({ direction: "out", status: "skipped_not_logged_in", length: String(text || "").length });
     return;
   }
   if (!target || !target.toUserId) {
-    process.stdout.write(`[WX OUT skipped: no target]\n${text}\n`);
+    writeRuntimeEvent({ direction: "out", status: "skipped_no_target", length: String(text || "").length });
     return;
   }
 
   try {
     await ilinkClient.sendTextMessage(botToken, target.toUserId, text, target.contextToken || "");
-    process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "out", to: shortId(target.toUserId), length: text.length })}\n`);
+    writeRuntimeEvent({ direction: "out", to: target.toUserId, length: text.length, status: "sent" });
   } catch (e) {
     if (String(e.message).includes("401")) {
-      process.stdout.write(`[WX OUT error] Token expired (401) during send. Clearing token.\n`);
+      writeRuntimeEvent({ direction: "out", to: target.toUserId, length: text.length, status: "token_expired", error: e }, process.stderr);
       botToken = "";
       process.exitCode = 1;
       process.exit();
@@ -106,7 +211,7 @@ async function sendWechatFile(target, filePath) {
     runtimeDir: RUNTIME_DIR,
     ilinkClient
   });
-  process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "out", media: result.type, to: shortId(target.toUserId), path: result.path, size: result.size })}\n`);
+  writeRuntimeEvent({ direction: "out", media: result.type, to: target.toUserId, length: result.size, status: "sent" });
   return result;
 }
 
@@ -115,6 +220,7 @@ let inboundQueue;
 const adapter = createWxBotAdapter({
   controlPlaneUrl,
   stateFile: WXBOT_STATE_FILE,
+  logger: runtimeLogger,
   onTurnSettled: () => {
     if (!inboundQueue) return;
     inboundQueue.markSettled();
@@ -143,13 +249,18 @@ inboundQueue = new InboundMessageQueue({
     }
   },
   onDispatchError: (error, item) => {
-    process.stderr.write(`codex dispatch failed: ${JSON.stringify({ to: shortId(item.target && item.target.toUserId), error: error.message || String(error) })}\n`);
+    writeRuntimeEvent({
+      direction: "queue",
+      to: item.target && item.target.toUserId,
+      status: "dispatch_failed",
+      error
+    }, process.stderr);
   }
 });
 
 setInterval(() => {
   reconcileQueue("timer").catch((error) => {
-    process.stderr.write(`queue reconcile failed: ${error.message || error}\n`);
+    writeRuntimeEvent({ direction: "queue", status: "reconcile_failed", error }, process.stderr);
   });
 }, RECONCILE_INTERVAL_MS);
 
@@ -186,8 +297,7 @@ async function main() {
     while (!stopping && botToken) {
       try {
         const result = await ilinkClient.getUpdates(botToken, getUpdatesBuf);
-        if (result.get_updates_buf) getUpdatesBuf = result.get_updates_buf;
-        if (result.sync_buf) getUpdatesBuf = result.sync_buf;
+        const nextUpdatesBuf = result.sync_buf || result.get_updates_buf || getUpdatesBuf;
 
         const ret = result.ret;
         if (ret !== undefined && ret !== 0) {
@@ -210,6 +320,10 @@ async function main() {
         for (const message of result.msgs || []) {
           const text = textFromIlinkMessage(message);
           const media = extractMediaItems(message);
+          if (isDuplicateInboundMessage(message)) {
+            writeRuntimeEvent({ direction: "in", from: message.from_user_id, length: text.length, status: "duplicate_skipped" });
+            continue;
+          }
           const target = {
             toUserId: message.from_user_id,
             contextToken: message.context_token || ""
@@ -218,7 +332,7 @@ async function main() {
           saveLastTarget(target, RUNTIME_DIR);
 
           if (text) {
-            process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "in", from: shortId(message.from_user_id), text })}\n`);
+            writeRuntimeEvent({ direction: "in", from: message.from_user_id, length: text.length, status: "received" });
           }
 
           if (isDirectCommand(text) && media.length === 0) {
@@ -237,11 +351,21 @@ async function main() {
 
           let mediaResult = { saved: [], errors: [] };
           if (media.length > 0) {
-            const desc = media.map(m => m.desc).join(", ");
-            process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "in", from: shortId(message.from_user_id), media: desc })}\n`);
+            writeRuntimeEvent({
+              direction: "in",
+              from: message.from_user_id,
+              media: media.map((item) => item.type),
+              count: media.length,
+              status: "media_received"
+            });
             mediaResult = await ilinkClient.downloadMediaItems(media, MEDIA_DIR);
             if (mediaResult.errors.length) {
-              process.stderr.write(`media save errors: ${JSON.stringify(mediaResult.errors.map(e => ({ type: e.type, error: e.error })))}\n`);
+              writeRuntimeEvent({
+                direction: "in",
+                from: message.from_user_id,
+                status: "media_save_failed",
+                error: mediaResult.errors.map((item) => errorSummary(item.error)).join(" | ")
+              }, process.stderr);
             }
           }
 
@@ -251,7 +375,11 @@ async function main() {
             saved: mediaResult.saved,
             errors: mediaResult.errors
           });
-          process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "queue", from: shortId(message.from_user_id), status: queueResult.status, held: queueResult.held || 0, queued: inboundQueue.queue.length, busy: inboundQueue.busy })}\n`);
+          writeRuntimeEvent({ direction: "queue", from: message.from_user_id, status: queueResult.status, held: queueResult.held || 0, queued: inboundQueue.queue.length, busy: inboundQueue.busy });
+        }
+        if (nextUpdatesBuf !== getUpdatesBuf) {
+          getUpdatesBuf = nextUpdatesBuf;
+          saveUpdatesCursor(getUpdatesBuf);
         }
       } catch (error) {
         if (error && error.name === "TimeoutError") continue;
@@ -270,7 +398,7 @@ async function reconcileQueue(reason, fromUserId = "") {
   try {
     const reconcile = await adapter.reconcileCurrentTurnState();
     if (reconcile.checked) {
-      process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), direction: "queue", from: shortId(fromUserId), status: "reconciled", reason, running: reconcile.running, turnStatus: reconcile.status || "" })}\n`);
+      writeRuntimeEvent({ direction: "queue", from: fromUserId, status: "reconciled", reason, running: reconcile.running, turnStatus: reconcile.status || "" });
     }
   } finally {
     reconcileInFlight = false;
@@ -424,6 +552,22 @@ function tryRequireQrcode() {
 
 function shortId(value) {
   return String(value || "").slice(0, 8);
+}
+
+function isDuplicateInboundMessage(message) {
+  const id = message && (message.msg_id || message.message_id || message.msgId || message.id);
+  if (!id) return false;
+  const now = Date.now();
+  for (const [key, timestamp] of processedInboundMessages) {
+    if (now - timestamp > INBOUND_DEDUP_TTL_MS) processedInboundMessages.delete(key);
+  }
+  const key = `${message.from_user_id || ""}:${id}`;
+  if (processedInboundMessages.has(key)) return true;
+  processedInboundMessages.set(key, now);
+  while (processedInboundMessages.size > INBOUND_DEDUP_MAX) {
+    processedInboundMessages.delete(processedInboundMessages.keys().next().value);
+  }
+  return false;
 }
 
 function isDirectCommand(text) {

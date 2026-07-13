@@ -11,6 +11,7 @@ export type CodexFollowerEventType =
   | "approval_response"
   | "interrupt"
   | "thread_state_changed"
+  | "diagnostic"
   | "error";
 
 export interface CodexFollowerOptions {
@@ -27,6 +28,7 @@ export interface ThreadSummary {
   sessionId: string | null;
   cwd: string | null;
   runtimeStatus: unknown;
+  sendable: boolean;
   raw: unknown;
 }
 
@@ -57,6 +59,8 @@ export interface CodexFollowerEvent {
   role?: "user" | "assistant" | "system";
   text?: string;
   state?: unknown;
+  code?: string;
+  message?: string;
   error?: unknown;
   raw?: unknown;
 }
@@ -67,12 +71,23 @@ export class CodexFollowerEventBus extends EventEmitter {
   on(event: CodexFollowerEventType | "*", listener: (event: CodexFollowerEvent) => void): this;
 }
 
+export interface WarmThreadResult {
+  ok: boolean;
+  conversationId?: string;
+  alreadyLoaded?: boolean;
+  broadcast?: boolean;
+  sendable?: boolean;
+  timeout?: boolean;
+  error?: string;
+}
+
 export class CodexFollowerCore {
   constructor(options?: CodexFollowerOptions);
   connect(): Promise<{ clientId: string }>;
   disconnect(): void;
   listThreads(): ThreadSummary[];
   loadHistory(conversationId: string): Promise<LoadHistoryResult>;
+  warmThread(conversationId: string): Promise<WarmThreadResult>;
   sendMessage(conversationId: string, text: string): Promise<SendMessageResult>;
   interrupt(conversationId: string): Promise<CommandResult>;
   approve(

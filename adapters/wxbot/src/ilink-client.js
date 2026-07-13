@@ -4,7 +4,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const ILINK_BASE = "https://ilinkai.weixin.qq.com";
+const ILINK_BASE = process.env.ILINK_BASE_URL || "https://ilinkai.weixin.qq.com";
 const WEIXIN_CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c";
 const CHANNEL_VERSION = "2.2.0";
 const ILINK_APP_ID = "bot";
@@ -417,6 +417,7 @@ function mediaDownloadUrl(item, cdnBaseUrl) {
 
 function assertWeixinMediaUrl(url, options = {}) {
   const parsed = new URL(url);
+  if (process.env.ILINK_ALLOW_INSECURE_MEDIA === "1" && parsed.protocol === "http:") return;
   if (parsed.protocol !== "https:") throw new Error(`blocked non-https media url: ${url}`);
   const allowedHosts = new Set(WEIXIN_MEDIA_HOSTS);
   if (options.cdnBaseUrl) allowedHosts.add(new URL(options.cdnBaseUrl).hostname);

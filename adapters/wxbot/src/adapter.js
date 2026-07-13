@@ -8,7 +8,7 @@ const {
   findThreadByPrefix,
   formatThread,
   historyText,
-  latestAssistantMessage,
+  latestAssistantMessageForTurn,
   splitMessage,
   turnsFromState
 } = require("./message-utils");
@@ -32,6 +32,8 @@ class WxBotAdapter {
     this.currentThread = null;
     this.lastCompletedAssistantMessage = "";
     this.lastCompletedTurnId = "";
+    this.awaitingTurnStart = false;
+    this.activeTurnId = "";
     this.pendingApprovalId = "";
     this.socket = null;
     this.reconnectTimer = null;
@@ -89,6 +91,10 @@ class WxBotAdapter {
       await this.reply("用法：/q <序号> 或 /q <id前缀>");
       return;
     }
+    if (this.awaitingTurnStart || this.activeTurnId) {
+      await this.reply("当前任务仍在运行，请先使用 /stop 中断后再切换会话");
+      return;
+    }
     const allThreads = await this.client.listThreads();
     const thread = findThreadByPrefix(allThreads, prefix);
     if (!thread) {
@@ -102,8 +108,26 @@ class WxBotAdapter {
     // Auto-warm if not loaded in Desktop
     if (!thread.sendable) {
       await this.reply("正在打开会话，请稍候...");
-      const warmResult = await this.client.warm(this.currentConversationId);
-      if (!warmResult.ok) {
+      this.logger.info && this.logger.info({
+        conversationId: this.currentConversationId,
+        status: "warm_started"
+      });
+      let warmResult;
+      try {
+        warmResult = await this.client.warm(this.currentConversationId);
+      } catch (error) {
+        const message = errorMessage(error);
+        if (!/Desktop 当前离线|fetch failed|ECONNREFUSED|ECONNRESET/i.test(message)) throw error;
+        warmResult = { ok: false, timeout: true, error: message };
+      }
+      this.logger.info && this.logger.info({
+        conversationId: this.currentConversationId,
+        status: warmResult.ok && warmResult.sendable
+          ? "warm_completed"
+          : (warmResult.timeout ? "warm_timeout" : "warm_failed"),
+        error: warmResult.ok ? undefined : warmResult.error
+      });
+      if (!warmResult.ok && !warmResult.timeout) {
         await this.reply("会话打开失败，请先在 Desktop 中手动打开此会话");
         return;
       }
@@ -113,18 +137,39 @@ class WxBotAdapter {
         (t) => (t.conversationId || t.id) === this.currentConversationId
       ) || thread;
       if (!this.currentThread.sendable) {
-        await this.reply("会话正在打开，但暂时还不能发送。请稍后重试 /q。");
-        return;
+        this.currentThread = {
+          ...this.currentThread,
+          sendable: false,
+          warmUnconfirmed: true
+        };
       }
     }
 
+    this.clearActiveTurnState();
     this.connectEvents();
     this.saveState();
     const rawTitle = (this.currentThread && this.currentThread.title) || this.currentConversationId;
     const short = String(rawTitle).replace(/\r?\n/g, " ");
     const display = short.length > 40 ? short.slice(0, 40) + "…" : short;
+    if (!this.currentThread.sendable) {
+      this.logger.warn && this.logger.warn({
+        conversationId: this.currentConversationId,
+        status: "switch_unconfirmed"
+      });
+      await this.reply([
+        "会话切换未确认：",
+        display,
+        "",
+        "Desktop 尚未返回可发送状态，请稍后重试 /q " + prefix
+      ].join("\n"));
+      return;
+    }
+    this.logger.info && this.logger.info({
+      conversationId: this.currentConversationId,
+      status: "switch_completed"
+    });
     await this.reply([
-      "当前会话：",
+      "会话切换完成：",
       this.currentConversationId.slice(0, 20) + "...",
       "",
       "标题：" + display
@@ -154,6 +199,7 @@ class WxBotAdapter {
   async commandStop() {
     if (!await this.requireConversation()) return;
     await this.client.interrupt(this.currentConversationId);
+    this.clearActiveTurnState();
     await this.reply("已发送中断请求");
   }
 
@@ -203,7 +249,14 @@ class WxBotAdapter {
 
   async sendUserMessage(message) {
     if (!await this.requireConversation()) return { ok: false, sent: false, reason: "no_conversation" };
-    await this.client.send(this.currentConversationId, message);
+    this.awaitingTurnStart = true;
+    this.activeTurnId = "";
+    try {
+      await this.client.send(this.currentConversationId, message);
+    } catch (error) {
+      this.clearActiveTurnState();
+      throw error;
+    }
     const rawTitle = (this.currentThread && this.currentThread.title) || this.currentConversationId;
     const short = String(rawTitle).replace(/\r?\n/g, " ");
     const display = short.length > 40 ? short.slice(0, 40) + "…" : short;
@@ -233,7 +286,9 @@ class WxBotAdapter {
 
     const conversationId = this.currentConversationId;
     this.socket = this.client.connectEvents(conversationId, {
-      message: (event) => this.handleEvent(event),
+      message: (event) => {
+        this.handleEvent(event).catch((error) => this.handleEventError(event, error));
+      },
       error: (error) => this.logger.warn && this.logger.warn(errorMessage(error)),
       close: () => this.scheduleReconnect(conversationId)
     });
@@ -250,7 +305,9 @@ class WxBotAdapter {
   async handleEvent(event) {
     if (!event || event.conversationId !== this.currentConversationId) return;
 
-    if (event.type === "turn_completed") {
+    if (event.type === "turn_started") {
+      this.handleTurnStarted(event.payload || event);
+    } else if (event.type === "turn_completed") {
       await this.handleTurnCompleted(event.payload || {});
     } else if (event.type === "turn_interrupted" || event.type === "interrupt") {
       await this.handleTurnInterrupted(event.payload || event);
@@ -278,33 +335,59 @@ class WxBotAdapter {
   }
 
   async reconcileCurrentTurnState() {
-    if (!this.currentConversationId || !this.onTurnSettled) return { checked: false };
+    if (!this.currentConversationId) return { checked: false };
     try {
       const history = await this.client.loadHistory(this.currentConversationId);
       const state = history.state || history;
       const latest = latestTurn(state);
       const status = latest && latest.status ? String(latest.status) : "";
-      if (!latest || isRunningTurnStatus(status)) {
+      if (!latest) {
+        return { checked: true, running: true, status };
+      }
+      if (isRunningTurnStatus(status)) {
+        this.handleTurnStarted({ turnId: latest.turnId || "", reason: "reconcile" });
         return { checked: true, running: true, status };
       }
       if (status === "completed") {
+        const turnId = String(latest.turnId || "");
         await this.handleTurnCompleted({
           conversationId: this.currentConversationId,
-          turnId: latest.turnId || "",
+          turnId,
           reason: "reconcile"
         });
         return { checked: true, running: false, status };
       }
-      await this.onTurnSettled({
-        conversationId: this.currentConversationId,
-        turnId: latest.turnId || "",
-        reason: "reconcile",
-        status
-      });
+      if (isInterruptedTurnStatus(status)) {
+        await this.handleTurnInterrupted({
+          conversationId: this.currentConversationId,
+          turnId: latest.turnId || "",
+          reason: "reconcile",
+          status
+        });
+      }
       return { checked: true, running: false, status };
     } catch (error) {
       this.logger.warn && this.logger.warn("Failed to reconcile turn state", errorMessage(error));
       return { checked: false, error };
+    }
+  }
+
+  async handleEventError(event, error) {
+    this.logger.warn && this.logger.warn({
+      conversationId: this.currentConversationId,
+      turnId: event && event.payload && event.payload.turnId,
+      status: "event_handler_failed",
+      error: errorMessage(error)
+    });
+    const payload = (event && event.payload) || event || {};
+    const turnId = String(payload.turnId || "");
+    if (turnId && this.isActiveTurn(turnId)) {
+      await this.settleActiveTurn({
+        conversationId: this.currentConversationId,
+        turnId,
+        reason: "event_handler_failed",
+        status: "completed"
+      });
     }
   }
 
@@ -328,37 +411,110 @@ class WxBotAdapter {
   }
 
   async handleTurnCompleted(payload) {
-    const payloadTurnId = payload.turnId || "";
+    const payloadTurnId = String(payload.turnId || "");
+    if (!this.isActiveTurn(payloadTurnId)) return;
+    let replyAttempted = false;
 
     try {
       const history = await this.client.loadHistory(this.currentConversationId);
       // follower-core returns {state: {turns: [...]}}, daily_server returns {items: [...]}
       const state = history.state || history;
-      const latest = latestAssistantMessage(state);
-      if (!latest || !latest.text) return;
+      const latest = latestAssistantMessageForTurn(state, payloadTurnId);
+      if (!latest || !latest.text) {
+        this.logger.info && this.logger.info({
+          conversationId: this.currentConversationId,
+          turnId: payloadTurnId,
+          phase: "",
+          length: 0,
+          status: "assistant_message_missing"
+        });
+        return;
+      }
       const completionTurnId = latest.turnId || payloadTurnId;
       if (completionTurnId && completionTurnId === this.lastCompletedTurnId) return;
-      if (completionTurnId) this.lastCompletedTurnId = completionTurnId;
 
-      this.lastCompletedAssistantMessage = latest.text;
+      replyAttempted = true;
       await this.reply(latest.text);
+      this.lastCompletedAssistantMessage = latest.text;
+      if (completionTurnId) this.lastCompletedTurnId = completionTurnId;
+      this.logger.info && this.logger.info({
+        conversationId: this.currentConversationId,
+        turnId: completionTurnId,
+        phase: latest.phase || "",
+        length: String(latest.text).length,
+        status: "reply_sent"
+      });
+      await this.settleActiveTurn({
+        conversationId: this.currentConversationId,
+        turnId: payloadTurnId,
+        reason: payload.reason || "completed",
+        status: "completed"
+      });
     } catch (e) {
-      this.logger.warn && this.logger.warn("Failed to load history for turn_completed", e);
-    } finally {
-      if (this.onTurnSettled) {
-        await this.onTurnSettled({ conversationId: this.currentConversationId, turnId: payloadTurnId });
+      this.logger.warn && this.logger.warn({
+        conversationId: this.currentConversationId,
+        turnId: payloadTurnId,
+        phase: "",
+        length: 0,
+        status: replyAttempted ? "reply_failed" : "history_load_failed",
+        error: errorMessage(e)
+      });
+      if (!replyAttempted) {
+        try {
+          await this.reply(this.toUserError(e));
+        } catch (replyError) {
+          this.logger.warn && this.logger.warn({
+            conversationId: this.currentConversationId,
+            turnId: payloadTurnId,
+            status: "error_notice_failed",
+            error: errorMessage(replyError)
+          });
+        }
+      } else {
+        await this.settleActiveTurn({
+          conversationId: this.currentConversationId,
+          turnId: payloadTurnId,
+          reason: "reply_failed",
+          status: "completed"
+        });
       }
     }
   }
 
   async handleTurnInterrupted(payload) {
-    if (!this.onTurnSettled) return;
-    await this.onTurnSettled({
+    const payloadTurnId = String(payload.turnId || "");
+    if (!this.isActiveTurn(payloadTurnId)) return;
+    await this.settleActiveTurn({
       conversationId: this.currentConversationId,
-      turnId: payload.turnId || "",
-      reason: "interrupted",
+      turnId: payloadTurnId,
+      reason: payload.reason || "interrupted",
       status: payload.status || "interrupted"
     });
+  }
+
+  handleTurnStarted(payload) {
+    const turnId = String(payload.turnId || "");
+    if (!turnId) return false;
+    if (this.activeTurnId && !this.awaitingTurnStart && this.activeTurnId !== turnId) return false;
+    this.activeTurnId = turnId;
+    this.awaitingTurnStart = false;
+    return true;
+  }
+
+  isActiveTurn(turnId) {
+    return !this.awaitingTurnStart
+      && Boolean(this.activeTurnId)
+      && String(turnId || "") === this.activeTurnId;
+  }
+
+  clearActiveTurnState() {
+    this.awaitingTurnStart = false;
+    this.activeTurnId = "";
+  }
+
+  async settleActiveTurn(event) {
+    this.clearActiveTurnState();
+    if (this.onTurnSettled) await this.onTurnSettled(event);
   }
 
   async requireConversation() {
@@ -429,6 +585,15 @@ function latestTurn(state) {
 function isRunningTurnStatus(status) {
   const normalized = String(status || "").toLowerCase();
   return normalized === "running" || normalized === "inprogress" || normalized === "in_progress";
+}
+
+function isInterruptedTurnStatus(status) {
+  const normalized = String(status || "").toLowerCase();
+  return normalized === "interrupted"
+    || normalized === "canceled"
+    || normalized === "cancelled"
+    || normalized === "aborted"
+    || normalized === "stopped";
 }
 
 function createWxBotAdapter(options) {

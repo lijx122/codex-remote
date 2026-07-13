@@ -22,6 +22,7 @@ class FakeClient {
     ];
     this.assistantText = "Summary\n\n已完成微信 Adapter MVP。";
     this.turnStatus = "completed";
+    this.warmMode = "ok";
   }
 
   async listThreads() {
@@ -54,6 +55,12 @@ class FakeClient {
   async interrupt(conversationId) {
     this.interrupted.push(conversationId);
     return { ok: true };
+  }
+
+  async warm(conversationId) {
+    if (this.warmMode === "timeout") return { ok: false, timeout: true };
+    if (this.warmMode === "offline") throw new Error("Desktop 当前离线");
+    return { ok: true, sendable: true, conversationId };
   }
 
   async approve(conversationId, approvalId, decision) {
@@ -89,6 +96,34 @@ class FakeClient {
   assert.equal(adapter.currentConversationId, "019ee451-eed0-7c21-b1a6-8e56d603e82b");
   assert.equal(JSON.parse(fs.readFileSync(stateFile, "utf8")).currentConversationId, adapter.currentConversationId);
 
+  client.threads.push({
+    conversationId: "22222222-2222-4222-8222-222222222222",
+    title: "warm timeout",
+    updatedAt: new Date().toISOString(),
+    sendable: false
+  });
+  client.warmMode = "timeout";
+  await adapter.handleText("/q 2");
+  assert.equal(adapter.currentConversationId, "22222222-2222-4222-8222-222222222222");
+  assert.equal(adapter.currentThread.warmUnconfirmed, true);
+  assert.equal(adapter.currentThread.sendable, false);
+
+  client.threads.push({
+    conversationId: "33333333-3333-4333-8333-333333333333",
+    title: "warm offline",
+    updatedAt: new Date().toISOString(),
+    sendable: false
+  });
+  client.warmMode = "offline";
+  await adapter.handleText("/q 3");
+  assert.equal(adapter.currentConversationId, "33333333-3333-4333-8333-333333333333");
+  assert.equal(adapter.currentThread.warmUnconfirmed, true);
+  assert.equal(adapter.currentThread.sendable, false);
+
+  client.warmMode = "ok";
+  await adapter.handleText("/q 1");
+  assert.equal(adapter.currentConversationId, "019ee451-eed0-7c21-b1a6-8e56d603e82b");
+
   const restoredAdapter = createWxBotAdapter({
     client,
     sendText: async (text) => replies.push(text),
@@ -107,6 +142,7 @@ class FakeClient {
   await adapter.handleText("/y");
   assert.equal(client.approvals[0].decision, true);
 
+  await adapter.handleEvent({ type: "turn_started", conversationId: adapter.currentConversationId, payload: { turnId: "t1" } });
   await adapter.handleEvent({ type: "turn_completed", conversationId: adapter.currentConversationId, payload: { turnId: "t1" } });
   assert.equal(settledCount, 1);
   assert.match(replies.at(-1), /已完成微信 Adapter MVP/);
@@ -125,17 +161,19 @@ class FakeClient {
     conversationId,
     state: canonicalState("completed", client.assistantText)
   });
+  const repliesBeforeHistoricalReconcile = replies.length;
   reconciled = await adapter.reconcileCurrentTurnState();
   assert.equal(reconciled.running, false);
   assert.equal(reconciled.status, "completed");
-  assert.equal(settledCount, 3);
-  assert.match(replies.at(-1), /已完成微信 Adapter MVP/);
+  assert.equal(settledCount, 2);
+  assert.equal(replies.length, repliesBeforeHistoricalReconcile);
 
   const repliesBeforeDuplicateReconcile = replies.length;
   reconciled = await adapter.reconcileCurrentTurnState();
   assert.equal(reconciled.running, false);
   assert.equal(reconciled.status, "completed");
   assert.equal(replies.length, repliesBeforeDuplicateReconcile);
+  assert.equal(settledCount, 2);
 
   client.loadHistory = async (conversationId) => ({
     conversationId,
@@ -143,10 +181,13 @@ class FakeClient {
   });
   reconciled = await adapter.reconcileCurrentTurnState();
   assert.equal(reconciled.running, true);
-  assert.equal(settledCount, 4);
+  assert.equal(settledCount, 2);
 
+  const settledBeforeActiveInterrupt = settledCount;
+  await adapter.handleText("interrupt this turn");
+  await adapter.handleEvent({ type: "turn_started", conversationId: adapter.currentConversationId, payload: { turnId: "t2" } });
   await adapter.handleEvent({ type: "turn_interrupted", conversationId: adapter.currentConversationId, payload: { turnId: "t2", status: "interrupted" } });
-  assert.equal(settledCount, 5);
+  assert.equal(settledCount, settledBeforeActiveInterrupt + 1);
 
   await adapter.handleText("/history");
   assert.match(replies.at(-1), /Summary/);
@@ -162,12 +203,227 @@ class FakeClient {
   client.loadHistory = async (conversationId) => ({
     conversationId,
     state: canonicalStateWithMessages([
-      { type: "agentMessage", text: "new commentary", phase: "commentary" },
-      { type: "agentMessage", text: "new final", phase: "final_answer" }
+      { type: "agentMessage", text: "Handoff: continue in the next session.", phase: "final_answer" },
+      { type: "agentMessage", text: "同一轮真正的最终答复。", phase: "final_answer" }
     ])
   });
+  await adapter.handleText("test two final messages");
+  await adapter.handleEvent({ type: "turn_started", conversationId: adapter.currentConversationId, payload: { turnId: "new-final-turn" } });
+  const repliesBeforeTwoFinals = replies.length;
   await adapter.handleEvent({ type: "turn_completed", conversationId: adapter.currentConversationId, payload: { turnId: "new-final-turn" } });
-  assert.match(replies.at(-1), /new final/);
+  assert.equal(replies.length, repliesBeforeTwoFinals + 1);
+  assert.match(replies.at(-1), /同一轮真正的最终答复/);
+  assert.doesNotMatch(replies.at(-1), /Handoff/);
+
+  client.loadHistory = async (conversationId) => ({
+    conversationId,
+    state: stateWithTurns([
+      {
+        turnId: "earlier-completed-turn",
+        turnStartedAtMs: 100,
+        status: "completed",
+        items: [{ type: "agentMessage", text: "较早轮的最终答复。", phase: "final_answer" }]
+      },
+      {
+        turnId: "newer-completed-turn",
+        turnStartedAtMs: 200,
+        status: "completed",
+        items: [{ type: "agentMessage", text: "较新轮的全局最终答复。", phase: "final_answer" }]
+      }
+    ])
+  });
+  await adapter.handleText("test payload turn id");
+  await adapter.handleEvent({ type: "turn_started", conversationId: adapter.currentConversationId, payload: { turnId: "earlier-completed-turn" } });
+  const repliesBeforeEarlierPayload = replies.length;
+  await adapter.handleEvent({
+    type: "turn_completed",
+    conversationId: adapter.currentConversationId,
+    payload: { turnId: "earlier-completed-turn" }
+  });
+  assert.equal(replies.length, repliesBeforeEarlierPayload + 1);
+  assert.match(replies.at(-1), /较早轮的最终答复/);
+  assert.doesNotMatch(replies.at(-1), /较新轮的全局最终答复/);
+
+  const activeReplies = [];
+  const activeSettlements = [];
+  const activeClient = new FakeClient();
+  const activeAdapter = createWxBotAdapter({
+    client: activeClient,
+    sendText: async (text) => activeReplies.push(text),
+    onTurnSettled: async (event) => activeSettlements.push(event),
+    logger: { info() {}, warn() {} }
+  });
+  await activeAdapter.handleText("/q 1");
+  await activeAdapter.handleText("start active turn reconciliation");
+  activeClient.loadHistory = async (conversationId) => ({
+    conversationId,
+    state: stateWithTurns([
+      {
+        turnId: "historical-turn",
+        turnStartedAtMs: 100,
+        status: "completed",
+        items: [{ type: "agentMessage", text: "historical reply", phase: "final_answer" }]
+      },
+      {
+        turnId: "active-turn",
+        turnStartedAtMs: 200,
+        status: "completed",
+        items: [{ type: "agentMessage", text: "active turn reply", phase: "final_answer" }]
+      }
+    ])
+  });
+
+  const repliesBeforeHistoricalCompletion = activeReplies.length;
+  await activeAdapter.handleEvent({
+    type: "turn_completed",
+    conversationId: activeAdapter.currentConversationId,
+    payload: { turnId: "historical-turn" }
+  });
+  assert.equal(activeReplies.length, repliesBeforeHistoricalCompletion);
+  assert.equal(activeSettlements.length, 0);
+
+  await activeAdapter.handleEvent({
+    type: "turn_started",
+    conversationId: activeAdapter.currentConversationId,
+    payload: { turnId: "active-turn" }
+  });
+  await activeAdapter.handleEvent({
+    type: "turn_completed",
+    conversationId: activeAdapter.currentConversationId,
+    payload: { turnId: "historical-turn" }
+  });
+  assert.equal(activeReplies.length, repliesBeforeHistoricalCompletion);
+  assert.equal(activeSettlements.length, 0);
+
+  await activeAdapter.handleEvent({
+    type: "turn_completed",
+    conversationId: activeAdapter.currentConversationId,
+    payload: { turnId: "active-turn" }
+  });
+  assert.equal(activeReplies.length, repliesBeforeHistoricalCompletion + 1);
+  assert.match(activeReplies.at(-1), /active turn reply/);
+  assert.equal(activeSettlements.length, 1);
+  assert.equal(activeSettlements[0].turnId, "active-turn");
+
+  await activeAdapter.handleText("start history failure turn");
+  await activeAdapter.handleEvent({
+    type: "turn_started",
+    conversationId: activeAdapter.currentConversationId,
+    payload: { turnId: "history-error-turn" }
+  });
+  activeClient.loadHistory = async () => { throw new Error("history unavailable"); };
+  await activeAdapter.handleEvent({
+    type: "turn_completed",
+    conversationId: activeAdapter.currentConversationId,
+    payload: { turnId: "history-error-turn" }
+  });
+  assert.equal(activeSettlements.length, 1);
+
+  await activeAdapter.handleEvent({
+    type: "turn_interrupted",
+    conversationId: activeAdapter.currentConversationId,
+    payload: { turnId: "other-turn", status: "interrupted" }
+  });
+  assert.equal(activeSettlements.length, 1);
+  await activeAdapter.handleEvent({
+    type: "turn_interrupted",
+    conversationId: activeAdapter.currentConversationId,
+    payload: { turnId: "history-error-turn", status: "interrupted" }
+  });
+  assert.equal(activeSettlements.length, 2);
+  assert.equal(activeSettlements[1].turnId, "history-error-turn");
+
+  const raceClient = new FakeClient();
+  const raceAdapter = createWxBotAdapter({
+    client: raceClient,
+    sendText: async () => {},
+    logger: { info() {}, warn() {} }
+  });
+  await raceAdapter.handleText("/q 1");
+  raceClient.send = async (conversationId, message) => {
+    raceClient.sent.push({ conversationId, message });
+    await raceAdapter.handleEvent({
+      type: "turn_started",
+      conversationId,
+      payload: { turnId: "fast-start-turn" }
+    });
+    return { ok: true };
+  };
+  await raceAdapter.handleText("fast start race");
+  assert.equal(raceAdapter.awaitingTurnStart, false);
+  assert.equal(raceAdapter.activeTurnId, "fast-start-turn");
+  raceClient.threads.push({
+    conversationId: "44444444-4444-4444-8444-444444444444",
+    title: "must not switch while active",
+    updatedAt: new Date().toISOString(),
+    sendable: true
+  });
+  const raceConversationId = raceAdapter.currentConversationId;
+  await raceAdapter.handleText("/q 2");
+  assert.equal(raceAdapter.currentConversationId, raceConversationId);
+
+  const failedReplies = [];
+  const failedWarnings = [];
+  const failedSettlements = [];
+  const failedClient = new FakeClient();
+  let rejectReplies = false;
+  const failedAdapter = createWxBotAdapter({
+    client: failedClient,
+    sendText: async (text) => {
+      if (rejectReplies) throw new Error("iLink sendmessage error: ret=-2");
+      failedReplies.push(text);
+    },
+    onTurnSettled: async (event) => failedSettlements.push(event),
+    logger: {
+      info() {},
+      warn(event) { failedWarnings.push(event); }
+    }
+  });
+  await failedAdapter.handleText("/q 1");
+  await failedAdapter.handleText("reply failure turn");
+  await failedAdapter.handleEvent({
+    type: "turn_started",
+    conversationId: failedAdapter.currentConversationId,
+    payload: { turnId: "reply-failure-turn" }
+  });
+  failedClient.loadHistory = async (conversationId) => ({
+    conversationId,
+    state: stateWithTurns([{
+      turnId: "reply-failure-turn",
+      status: "completed",
+      items: [{ type: "agentMessage", text: "reply that cannot be delivered", phase: "final_answer" }]
+    }])
+  });
+  rejectReplies = true;
+  await failedAdapter.handleEvent({
+    type: "turn_completed",
+    conversationId: failedAdapter.currentConversationId,
+    payload: { turnId: "reply-failure-turn" }
+  });
+  assert.equal(failedSettlements.length, 1);
+  assert.equal(failedSettlements[0].reason, "reply_failed");
+  assert.equal(failedAdapter.activeTurnId, "");
+  assert.equal(failedWarnings.some((event) => event.status === "reply_failed"), true);
+
+  const eventFailureWarnings = [];
+  const eventFailureClient = new FakeClient();
+  let eventFailureReject = false;
+  const eventFailureAdapter = createWxBotAdapter({
+    client: eventFailureClient,
+    sendText: async () => {
+      if (eventFailureReject) throw new Error("iLink sendmessage error: ret=-2");
+    },
+    logger: { info() {}, warn(event) { eventFailureWarnings.push(event); } }
+  });
+  await eventFailureAdapter.handleText("/q 1");
+  eventFailureReject = true;
+  eventFailureClient.handlers.message({
+    type: "approval_request",
+    conversationId: eventFailureAdapter.currentConversationId,
+    payload: { approvalId: "approval-failure", raw: { command: "echo test" } }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(eventFailureWarnings.some((event) => event.status === "event_handler_failed"), true);
 
   const mediaMessage = {
     message_type: 1,
@@ -468,5 +724,17 @@ function canonicalStateWithMessages(items) {
         items
       }
     ]
+  };
+}
+
+function stateWithTurns(turns) {
+  return {
+    turns: [],
+    turnHistory: {
+      kind: "canonical",
+      history: {
+        entitiesByKey: Object.fromEntries(turns.map((turn) => [`turn:${turn.turnId}`, turn]))
+      }
+    }
   };
 }

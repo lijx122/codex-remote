@@ -28,13 +28,19 @@ class CodexFollowerCore {
     this.events = new CodexFollowerEventBus();
     this.threads = new Map();
     this.histories = new Map();
+    this.streamStates = new Map();
     this.pendingApprovals = new Map();
     this.lastPublishedTurnEvents = new Map();
+    this.resyncPromise = null;
     this.connected = false;
     this.codexHome = options.codexHome || defaultCodexHome();
+    this.openThread = options.openThread || openThreadDeepLink;
 
     this.transport.on("broadcast", (message) => this.handleBroadcast(message));
     this.transport.on("server-request", (message) => this.handleServerRequest(message));
+    this.transport.on("close", () => {
+      this.connected = false;
+    });
     this.transport.on("error", (error) => {
       this.events.publish({ type: "error", error, raw: error });
     });
@@ -402,13 +408,10 @@ class CodexFollowerCore {
       const turnId = message.turnId || `${conversationId}-${turns.length}`;
       const turn = ensureLocalTurn(turns, turnsById, turnId, item.timestamp);
       turn.items.push(message);
-      if (message.type === "agentMessage" && message.text && (message.phase === "final_answer" || !message.phase)) {
-        turn.status = "completed";
-      }
     }
 
     for (const turn of turns) {
-      if (!turn.status) turn.status = hasFinalAssistant(turn) ? "completed" : "completed";
+      if (!turn.status) turn.status = "unknown";
     }
 
     const state = {
@@ -496,11 +499,20 @@ class CodexFollowerCore {
   async warmThread(conversationId) {
     this.assertConversationId(conversationId);
 
-    // Already loaded — nothing to do
     const alreadyKnown = this.threads.has(conversationId);
-    const openResult = await openThreadDeepLink(conversationId);
-    if (!openResult.ok) return openResult;
+    if (alreadyKnown) {
+      return {
+        ok: true,
+        conversationId,
+        alreadyLoaded: true,
+        broadcast: false,
+        sendable: true
+      };
+    }
+    const openResult = await this.openThread(conversationId);
+    if (!openResult.ok) return { ...openResult, conversationId, sendable: false };
 
+    let stopWaiting;
     const broadcastResult = await new Promise((resolve) => {
       const timeoutMs = alreadyKnown ? 3000 : 15000;
       const timer = setTimeout(() => {
@@ -511,23 +523,32 @@ class CodexFollowerCore {
       const onBroadcast = (message) => {
         if (message.method !== "thread-stream-state-changed") return;
         const params = message.params || {};
-        if (params.conversationId === conversationId) {
+        if (params.conversationId === conversationId && this.threads.has(conversationId)) {
           clearTimeout(timer);
           this.transport.off("broadcast", onBroadcast);
-          // Give a small grace period for the handler to update this.threads
-          setImmediate(() => resolve({ ok: true, alreadyLoaded: false }));
+          resolve({ ok: true, alreadyLoaded: false });
         }
       };
 
       this.transport.on("broadcast", onBroadcast);
+      stopWaiting = (result) => {
+        clearTimeout(timer);
+        this.transport.off("broadcast", onBroadcast);
+        resolve(result);
+      };
+      this.transport.reconnect().catch((error) => {
+        stopWaiting({ ok: false, error: error.message });
+      });
     });
-    if (!broadcastResult.ok && !this.threads.has(conversationId)) return broadcastResult;
-    await sleep(1500);
+    if (!this.threads.has(conversationId)) {
+      return { ...broadcastResult, conversationId, sendable: false };
+    }
     return {
       ok: true,
+      conversationId,
       alreadyLoaded: alreadyKnown,
       broadcast: broadcastResult.ok,
-      sendable: this.threads.has(conversationId)
+      sendable: true
     };
   }
 
@@ -536,12 +557,17 @@ class CodexFollowerCore {
     if (!text || typeof text !== "string") {
       throw new Error("text is required");
     }
-    const history = await this.loadHistory(conversationId);
-    const turnStartParams = this.buildStartTurnParams(conversationId, text, history.state);
-    const response = await this.transport.request(
-      "thread-follower-start-turn",
-      { conversationId, turnStartParams }
-    );
+    let response;
+    try {
+      response = await this.sendMessageOnce(conversationId, text);
+    } catch (error) {
+      if (!isMissingDesktopClientError(error)) throw error;
+      this.threads.delete(conversationId);
+      this.streamStates.delete(conversationId);
+      const warmResult = await this.warmThread(conversationId);
+      if (!warmResult.ok || !warmResult.sendable) throw error;
+      response = await this.sendMessageOnce(conversationId, text);
+    }
     this.events.publish({
       type: "message",
       conversationId,
@@ -550,6 +576,15 @@ class CodexFollowerCore {
       raw: response
     });
     return { ok: true, raw: response };
+  }
+
+  async sendMessageOnce(conversationId, text) {
+    const history = await this.loadHistory(conversationId);
+    const turnStartParams = this.buildStartTurnParams(conversationId, text, history.state);
+    return this.transport.send(
+      "thread-follower-start-turn",
+      { conversationId, turnStartParams }
+    );
   }
 
   async interrupt(conversationId) {
@@ -675,6 +710,18 @@ class CodexFollowerCore {
   }
 
   handleBroadcast(message) {
+    if (message.method === "ipc-connection-reset") {
+      this.threads.clear();
+      this.streamStates.clear();
+      this.publishDiagnostic("ipc-connection-reset", null, message);
+      return;
+    }
+
+    if (message.method === "thread-stream-following-changed") {
+      this.handleFollowingChanged(message);
+      return;
+    }
+
     if (message.method !== "thread-stream-state-changed") {
       return;
     }
@@ -682,30 +729,129 @@ class CodexFollowerCore {
     const params = message.params || {};
     const conversationId = params.conversationId;
     const change = params.change || {};
-    const state = change.conversationState;
-
-    if (state && conversationId) {
-      this.histories.set(conversationId, state);
-      this.threads.set(conversationId, {
-        id: conversationId,
-        title: state.title || null,
-        updatedAt: state.updatedAt || state.recencyAt || state.createdAt || null,
-        sessionId: state.sessionId || null,
-        cwd: state.cwd || null,
-        runtimeStatus: state.threadRuntimeStatus || null,
-        raw: state
-      });
+    if (!conversationId) {
+      this.publishDiagnostic("stream-missing-conversation-id", null, message);
+      return;
     }
+
+    const owner = message.sourceClientId || params.sourceClientId || null;
+    const tracked = this.streamStates.get(conversationId);
+    const ownerChanged = tracked && tracked.owner && owner && tracked.owner !== owner;
+    if (ownerChanged && !isSnapshotChange(change)) {
+      this.invalidateLiveThread(conversationId, "stream-owner-changed", message, {
+        owner,
+        revision: null,
+        following: tracked.following !== false
+      });
+      return;
+    }
+    if (tracked && tracked.following === false) {
+      this.invalidateLiveThread(conversationId, "stream-not-following", message, tracked);
+      return;
+    }
+
+    let state;
+    const revision = change.revision;
+    if (!change.type && Object.prototype.hasOwnProperty.call(change, "conversationState")) {
+      state = change.conversationState;
+    } else if (change.type === "snapshot") {
+      if (!change.conversationState || typeof change.conversationState !== "object") {
+        this.invalidateLiveThread(conversationId, "invalid-stream-snapshot", message, tracked);
+        return;
+      }
+      if (tracked && tracked.owner === owner && tracked.revision === revision) return;
+      state = change.conversationState;
+    } else if (isPatchChange(change)) {
+      const patches = patchListFromChange(change);
+      if (tracked && tracked.revision === revision) return;
+      if (
+        !tracked
+        || tracked.revision !== change.baseRevision
+        || !Number.isInteger(change.baseRevision)
+        || !Number.isInteger(revision)
+        || revision !== change.baseRevision + 1
+      ) {
+        this.invalidateLiveThread(conversationId, "stream-revision-gap", message, tracked);
+        return;
+      }
+      try {
+        state = applyStatePatches(this.histories.get(conversationId), patches);
+      } catch (error) {
+        this.invalidateLiveThread(conversationId, "stream-patch-failed", message, tracked, error);
+        this.requestStreamResync(conversationId);
+        return;
+      }
+    } else {
+      this.invalidateLiveThread(conversationId, "unsupported-stream-change", message, tracked);
+      return;
+    }
+
+    if (!state || typeof state !== "object") {
+      this.invalidateLiveThread(conversationId, "invalid-stream-state", message, tracked);
+      return;
+    }
+
+    const storedState = Number.isInteger(revision) ? { ...state, revision } : state;
+    this.histories.set(conversationId, storedState);
+    this.streamStates.set(conversationId, {
+      owner: owner || (tracked && tracked.owner) || null,
+      revision: Number.isInteger(revision) ? revision : null,
+      following: true
+    });
+    this.threads.set(conversationId, threadFromState(conversationId, storedState));
 
     this.events.publish({
       type: "thread_state_changed",
       conversationId,
-      revision: change.revision,
-      state: state || null,
+      revision,
+      state: storedState,
       raw: message
     });
 
-    this.publishTurnEvents(conversationId, state, message);
+    this.publishTurnEvents(conversationId, storedState, message);
+  }
+
+  handleFollowingChanged(message) {
+    const params = message.params || {};
+    const conversationId = params.conversationId;
+    const following = params.following ?? params.isFollowing ?? (params.change && params.change.following);
+    if (conversationId) {
+      const tracked = this.streamStates.get(conversationId) || { owner: null, revision: null };
+      this.streamStates.set(conversationId, { ...tracked, following: following !== false });
+      if (following === false) this.threads.delete(conversationId);
+    }
+    this.publishDiagnostic(
+      following === false ? "thread-stream-following-stopped" : "thread-stream-following-changed",
+      conversationId,
+      message
+    );
+  }
+
+  invalidateLiveThread(conversationId, code, raw, streamState, error) {
+    this.threads.delete(conversationId);
+    if (streamState) this.streamStates.set(conversationId, streamState);
+    this.publishDiagnostic(code, conversationId, raw, error);
+  }
+
+  requestStreamResync(conversationId) {
+    if (this.resyncPromise) return;
+    this.resyncPromise = Promise.resolve()
+      .then(() => this.transport.reconnect())
+      .catch((error) => this.publishDiagnostic("stream-resync-failed", conversationId, null, error))
+      .finally(() => {
+        this.resyncPromise = null;
+      });
+  }
+
+  publishDiagnostic(code, conversationId, raw, error) {
+    this.events.publish({
+      type: "diagnostic",
+      code,
+      conversationId: conversationId || undefined,
+      message: error ? error.message : code,
+      error,
+      raw
+    });
   }
 
   publishTurnEvents(conversationId, state, raw) {
@@ -732,22 +878,23 @@ class CodexFollowerCore {
       return;
     }
 
-    const localState = this.mergeWithLocalHistory(state, this.loadLocalHistory(conversationId));
-    const localCompletedTurn = latestLocalFinalTurn(localState);
-    if (localCompletedTurn) {
-      this.publishTurnEventOnce(conversationId, "turn_completed", localCompletedTurn, "completed", raw, {
-        type: "turn_completed",
-        raw
-      });
-      return;
-    }
-
     if (isInterruptedTurnStatus(broadcastStatus)) {
       this.publishTurnEventOnce(conversationId, "turn_interrupted", broadcastLastTurn, broadcastStatus, raw, {
         type: "turn_interrupted",
         status: broadcastStatus,
         raw
       });
+      return;
+    }
+
+    if (state.source === "rollout" || state.source === "merged-rollout") {
+      const localCompletedTurn = latestLocalFinalTurn(state);
+      if (localCompletedTurn) {
+        this.publishTurnEventOnce(conversationId, "turn_completed", localCompletedTurn, "completed", raw, {
+          type: "turn_completed",
+          raw
+        });
+      }
     }
   }
 
@@ -810,6 +957,131 @@ function createCodexFollower(options) {
   return new CodexFollowerCore(options);
 }
 
+function threadFromState(conversationId, state) {
+  return {
+    id: conversationId,
+    title: state.title || null,
+    updatedAt: state.updatedAt || state.recencyAt || state.createdAt || null,
+    sessionId: state.sessionId || null,
+    cwd: state.cwd || null,
+    runtimeStatus: state.threadRuntimeStatus || null,
+    raw: state
+  };
+}
+
+function applyStatePatches(previous, patches) {
+  if (!previous || typeof previous !== "object" || !Array.isArray(patches)) {
+    throw new Error("patch baseline or patches are invalid");
+  }
+  let state = structuredClone(previous);
+  for (const patch of patches) state = applyStatePatch(state, patch);
+  return state;
+}
+
+function applyStatePatch(state, patch) {
+  const path = patch && normalizePatchPath(patch.path);
+  if (!patch || !["add", "replace", "remove"].includes(patch.op) || !path) {
+    throw new Error("invalid patch operation");
+  }
+  if (path.length === 0) {
+    if (patch.op === "remove") throw new Error("cannot remove conversation state root");
+    if (!patch.value || typeof patch.value !== "object") throw new Error("invalid conversation state root");
+    return structuredClone(patch.value);
+  }
+  let parent = state;
+  for (let index = 0; index < path.length - 1; index += 1) {
+    const segment = path[index];
+    const nextSegment = path[index + 1];
+    assertSafePatchSegment(segment);
+    if (!parent || typeof parent !== "object") {
+      throw new Error("patch path does not exist");
+    }
+    if (Array.isArray(parent)) {
+      const arrayIndex = segment === "-" ? -1 : Number(segment);
+      if (!Number.isInteger(arrayIndex) || arrayIndex < 0) throw new Error("invalid array patch index");
+      if (parent[arrayIndex] === undefined || parent[arrayIndex] === null) {
+        if (patch.op !== "add") throw new Error("patch path does not exist");
+        parent[arrayIndex] = createPatchContainer(nextSegment);
+      }
+    } else if (!Object.prototype.hasOwnProperty.call(parent, segment) || parent[segment] === null) {
+      if (patch.op !== "add") throw new Error("patch path does not exist");
+      parent[segment] = createPatchContainer(nextSegment);
+    }
+    parent = parent[segment];
+  }
+  const key = path[path.length - 1];
+  assertSafePatchSegment(key);
+  if (!parent || typeof parent !== "object") throw new Error("patch parent is invalid");
+
+  if (Array.isArray(parent)) {
+    const index = key === "-" ? parent.length : Number(key);
+    if (!Number.isInteger(index) || index < 0) throw new Error("invalid array patch index");
+    if (patch.op === "add") {
+      if (index > parent.length) throw new Error("array add index is out of range");
+      parent.splice(index, 0, structuredClone(patch.value));
+      return state;
+    }
+    if (index >= parent.length) throw new Error("array patch index is out of range");
+    if (patch.op === "remove") parent.splice(index, 1);
+    else parent[index] = structuredClone(patch.value);
+    return state;
+  }
+
+  const exists = Object.prototype.hasOwnProperty.call(parent, key);
+  if (patch.op !== "add" && !exists) throw new Error("patch target does not exist");
+  if (patch.op === "remove") delete parent[key];
+  else parent[key] = structuredClone(patch.value);
+  return state;
+}
+
+function normalizePatchPath(path) {
+  if (Array.isArray(path)) return path.map((segment) => String(segment));
+  if (typeof path !== "string") return null;
+  if (!path) return [];
+  const segments = path.startsWith("/") ? path.slice(1).split("/") : path.split("/");
+  return segments.map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+
+function createPatchContainer(nextSegment) {
+  return /^\d+$/.test(String(nextSegment)) ? [] : {};
+}
+
+function isSnapshotChange(change) {
+  return change && (
+    change.type === "snapshot"
+    || (!change.type && Object.prototype.hasOwnProperty.call(change, "conversationState"))
+  );
+}
+
+function isPatchChange(change) {
+  return change && (
+    change.type === "patch"
+    || change.type === "patches"
+    || Array.isArray(change.patch)
+    || Array.isArray(change.patches)
+  );
+}
+
+function patchListFromChange(change) {
+  if (Array.isArray(change.patches)) return change.patches;
+  if (Array.isArray(change.patch)) return change.patch;
+  return [];
+}
+
+function assertSafePatchSegment(segment) {
+  if (segment === "__proto__" || segment === "prototype" || segment === "constructor") {
+    throw new Error("unsafe patch path");
+  }
+}
+
+function isMissingDesktopClientError(error) {
+  const message = [
+    error && error.message,
+    error && error.response && error.response.error
+  ].filter(Boolean).join(" ");
+  return /no-client-found|no client found|not found|not open|未在\s*Desktop\s*中打开|Desktop.*(?:未打开|离线)/i.test(message);
+}
+
 function openThreadDeepLink(conversationId) {
   return new Promise((resolve) => {
     const { exec } = require("node:child_process");
@@ -822,10 +1094,6 @@ function openThreadDeepLink(conversationId) {
       }
     );
   });
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function isInterruptedTurnStatus(status) {

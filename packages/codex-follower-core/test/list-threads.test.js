@@ -16,6 +16,10 @@ const ids = {
   subDbOnly: "55555555-5555-4555-8555-555555555555",
   userBroadcast: "66666666-6666-4666-8666-666666666666",
   subBroadcast: "77777777-7777-4777-8777-777777777777",
+  rolloutOnlyFinal: "88888888-8888-4888-8888-888888888888",
+  rolloutLifecycle: "99999999-9999-4999-8999-999999999999",
+  v11Broadcast: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  resetBroadcast: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
 };
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-follower-"));
@@ -31,6 +35,8 @@ try {
   writeRollout(tmp, ids.subIndexedMeta, { thread_source: "subagent", cwd: "F:\\sub" });
   writeRollout(tmp, ids.userDbOnly, { thread_source: "user", cwd: "F:\\db-user" });
   writeRollout(tmp, ids.subDbOnly, { thread_source: "user", cwd: "F:\\db-sub" });
+  writeRollout(tmp, ids.rolloutOnlyFinal, { thread_source: "user", cwd: "F:\\rollout-final" });
+  writeRollout(tmp, ids.rolloutLifecycle, { thread_source: "user", cwd: "F:\\rollout-lifecycle" });
 
   writeStateDb(tmp, [
     { id: ids.subIndexedDb, title: "indexed sub db", archived: 0, thread_source: "subagent" },
@@ -104,16 +110,188 @@ try {
   });
   assert.equal(completedTurn && completedTurn.turnId, "turn-completed");
 
-  appendRolloutMessages(tmp, ids.userIndexed, [
-    userResponse("new-turn", "new user"),
-    assistantResponse("new-turn", "new final")
+  appendRolloutMessages(tmp, ids.rolloutOnlyFinal, [
+    userResponse("final-only-turn", "new user"),
+    assistantResponse("final-only-turn", "new final")
   ]);
-  let rolloutCompletedTurn = null;
+  const rolloutCompletedTurns = [];
   core.events.on("turn_completed", (event) => {
-    rolloutCompletedTurn = event;
+    if (event.conversationId === ids.rolloutOnlyFinal) rolloutCompletedTurns.push(event);
   });
-  core.publishTurnEvents(ids.userIndexed, canonicalState("old-turn", "completed", { includeFinal: false }), {});
-  assert.equal(rolloutCompletedTurn && rolloutCompletedTurn.turnId, "new-turn");
+  core.publishTurnEvents(
+    ids.rolloutOnlyFinal,
+    core.loadLocalHistory(ids.rolloutOnlyFinal),
+    {}
+  );
+  assert.equal(rolloutCompletedTurns.length, 0, "final_answer without task_complete must not complete the turn");
+
+  const lifecycleTurnId = "rollout-lifecycle-turn";
+  const lifecycleCompletedTurns = [];
+  core.events.on("turn_completed", (event) => {
+    if (event.conversationId === ids.rolloutLifecycle) lifecycleCompletedTurns.push(event);
+  });
+
+  appendRolloutRecords(tmp, ids.rolloutLifecycle, [rolloutEvent(lifecycleTurnId, "task_started")]);
+  let lifecycleState = core.loadLocalHistory(ids.rolloutLifecycle);
+  assert.equal(lifecycleState.turns.at(-1).status, "running");
+
+  appendRolloutMessages(tmp, ids.rolloutLifecycle, [
+    assistantResponse(lifecycleTurnId, "Handoff: continue this task in the next session.")
+  ]);
+  lifecycleState = core.loadLocalHistory(ids.rolloutLifecycle);
+  core.publishTurnEvents(ids.rolloutLifecycle, lifecycleState, {});
+  assert.equal(lifecycleState.turns.at(-1).status, "running");
+  assert.equal(lifecycleCompletedTurns.length, 0);
+
+  appendRolloutMessages(tmp, ids.rolloutLifecycle, [
+    assistantResponse(lifecycleTurnId, "中文最终答复。")
+  ]);
+  lifecycleState = core.loadLocalHistory(ids.rolloutLifecycle);
+  core.publishTurnEvents(ids.rolloutLifecycle, lifecycleState, {});
+  assert.equal(lifecycleState.turns.at(-1).status, "running");
+  assert.equal(lifecycleCompletedTurns.length, 0);
+
+  appendRolloutRecords(tmp, ids.rolloutLifecycle, [rolloutEvent(lifecycleTurnId, "task_complete")]);
+  lifecycleState = core.loadLocalHistory(ids.rolloutLifecycle);
+  core.publishTurnEvents(ids.rolloutLifecycle, lifecycleState, {});
+  core.publishTurnEvents(ids.rolloutLifecycle, lifecycleState, {});
+  assert.equal(lifecycleState.turns.at(-1).status, "completed");
+  assert.deepEqual(
+    lifecycleState.turns.at(-1).items.filter((item) => item.phase === "final_answer").map((item) => item.text),
+    ["Handoff: continue this task in the next session.", "中文最终答复。"]
+  );
+  assert.equal(lifecycleCompletedTurns.length, 1);
+  assert.equal(lifecycleCompletedTurns[0].turnId, lifecycleTurnId);
+
+  const snapshot = v11State("v11 snapshot", "running");
+  core.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId: ids.v11Broadcast,
+      change: { type: "snapshot", revision: 10, conversationState: snapshot }
+    }
+  });
+  assert.equal(core.histories.get(ids.v11Broadcast).revision, 10);
+  assert.equal(core.listThreads().find((thread) => thread.id === ids.v11Broadcast).title, "v11 snapshot");
+
+  const patch = {
+    type: "patches",
+    baseRevision: 10,
+    revision: 11,
+    patches: [
+      { op: "replace", path: ["title"], value: "v11 patched" },
+      { op: "add", path: ["threadRuntimeStatus"], value: { type: "active" } }
+    ]
+  };
+  core.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: { conversationId: ids.v11Broadcast, change: patch }
+  });
+  assert.equal(core.histories.get(ids.v11Broadcast).revision, 11);
+  assert.equal(core.histories.get(ids.v11Broadcast).title, "v11 patched");
+  const patchedThread = core.listThreads().find((thread) => thread.id === ids.v11Broadcast);
+  assert.equal(patchedThread.title, "v11 patched");
+  assert.deepEqual(patchedThread.runtimeStatus, { type: "active" });
+
+  const patchedState = JSON.stringify(core.histories.get(ids.v11Broadcast));
+  core.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: { conversationId: ids.v11Broadcast, change: patch }
+  });
+  assert.equal(JSON.stringify(core.histories.get(ids.v11Broadcast)), patchedState);
+
+  core.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId: ids.v11Broadcast,
+      change: {
+        type: "patches",
+        baseRevision: 13,
+        revision: 14,
+        patches: [{ op: "replace", path: ["title"], value: "gap polluted" }]
+      }
+    }
+  });
+  assert.equal(core.histories.get(ids.v11Broadcast).revision, 11);
+  assert.equal(core.histories.get(ids.v11Broadcast).title, "v11 patched");
+  assert.equal(
+    core.listThreads().some((thread) => thread.id === ids.v11Broadcast && thread.sendable),
+    false
+  );
+
+  const ownerResetId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  core.handleBroadcast({
+    sourceClientId: "desktop-owner-a",
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId: ownerResetId,
+      change: { type: "snapshot", revision: 1, conversationState: { title: "owner a", turns: [] } }
+    }
+  });
+  core.handleBroadcast({
+    sourceClientId: "desktop-owner-b",
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId: ownerResetId,
+      change: { type: "snapshot", revision: 2, conversationState: { title: "owner b", turns: [] } }
+    }
+  });
+  assert.equal(core.histories.get(ownerResetId).title, "owner b");
+  assert.equal(core.listThreads().some((thread) => thread.id === ownerResetId && thread.sendable), true);
+
+  const nestedPatchId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  core.handleBroadcast({
+    sourceClientId: "desktop-owner-b",
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId: nestedPatchId,
+      change: { type: "snapshot", revision: 1, conversationState: { title: "nested", turnHistory: null, turns: [] } }
+    }
+  });
+  core.handleBroadcast({
+    sourceClientId: "desktop-owner-b",
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId: nestedPatchId,
+      change: {
+        type: "patch",
+        baseRevision: 1,
+        revision: 2,
+        patch: [{
+          op: "add",
+          path: "/turnHistory/history/entitiesByKey/turn:nested",
+          value: { turnId: "nested", status: "running", items: [] }
+        }]
+      }
+    }
+  });
+  assert.equal(core.histories.get(nestedPatchId).revision, 2);
+  assert.equal(
+    core.histories.get(nestedPatchId).turnHistory.history.entitiesByKey["turn:nested"].turnId,
+    "nested"
+  );
+
+  core.handleBroadcast({
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId: ids.resetBroadcast,
+      change: { conversationState: canonicalState("reset-turn", "running") }
+    }
+  });
+  assert.equal(core.listThreads().some((thread) => thread.id === ids.resetBroadcast && thread.sendable), true);
+  core.handleBroadcast({ method: "ipc-connection-reset", params: {} });
+  assert.equal(
+    core.listThreads().some((thread) => thread.id === ids.resetBroadcast && thread.sendable),
+    false
+  );
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }
@@ -137,12 +315,27 @@ function writeRollout(root, id, meta) {
 }
 
 function appendRolloutMessages(root, id, messages) {
+  appendRolloutRecords(
+    root,
+    id,
+    messages.map((payload) => ({ type: "response_item", payload }))
+  );
+}
+
+function appendRolloutRecords(root, id, records) {
   const filePath = path.join(root, "sessions", "2026", "01", "01", `rollout-2026-01-01T00-00-00-${id}.jsonl`);
   fs.appendFileSync(
     filePath,
-    messages.map((payload) => JSON.stringify({ type: "response_item", payload })).join("\n") + "\n",
+    records.map((record) => JSON.stringify(record)).join("\n") + "\n",
     "utf8"
   );
+}
+
+function rolloutEvent(turnId, type) {
+  return {
+    type: "event_msg",
+    payload: { type, turn_id: turnId }
+  };
 }
 
 function userResponse(turnId, text) {
@@ -216,5 +409,13 @@ function canonicalState(turnId, status, options = {}) {
         }
       }
     }
+  };
+}
+
+function v11State(title, status) {
+  return {
+    title,
+    threadRuntimeStatus: { type: status },
+    turns: [{ turnId: "v11-turn", status, items: [] }]
   };
 }

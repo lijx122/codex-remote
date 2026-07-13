@@ -16,7 +16,7 @@ const LISTEN_MS = Number(process.env.CODEX_IPC_LISTEN_MS || "3000");
 const LOG_FILE = process.env.CODEX_IPC_LOG || "";
 const SUBMIT_PARAMS_JSON = process.env.CODEX_IPC_SUBMIT_PARAMS_JSON || "";
 const VERSIONS = {
-  "thread-stream-state-changed": 7,
+  "thread-stream-state-changed": 11,
   "thread-read-state-changed": 1,
   "thread-archived": 2,
   "thread-unarchived": 1,
@@ -26,7 +26,7 @@ const VERSIONS = {
   "thread-follower-steer-turn": 1,
   "thread-follower-interrupt-turn": 2,
   "thread-follower-update-thread-settings": 1,
-  "thread-follower-edit-last-user-turn": 1,
+  "thread-follower-edit-last-user-turn": 2,
   "thread-follower-command-approval-decision": 1,
   "thread-follower-file-approval-decision": 1,
   "thread-follower-permissions-request-approval-response": 1,
