@@ -27,7 +27,7 @@ const INTERRUPTED_TURN_STATUSES = new Set([
 
 class CodexFollowerCore {
   constructor(options = {}) {
-    const transportMode = options.transportMode || process.env.CODEX_TRANSPORT || "app-server";
+    const transportMode = options.transportMode || process.env.CODEX_TRANSPORT || "ipc";
     this.transport = options.transport
       || (transportMode === "ipc" ? new IpcTransport(options) : new AppServerTransport(options));
     this.events = new CodexFollowerEventBus();
@@ -135,6 +135,7 @@ class CodexFollowerCore {
 
     // Pass 3: overlay broadcast data (always more current)
     for (const thread of this.threads.values()) {
+      if (archivedIds.has(thread.id) || isArchivedRolloutPath(rolloutMap.get(thread.id))) continue;
       if (this.isSubagentThread(thread, dbThreadMap.get(thread.id), rolloutMap)) continue;
       const existing = merged.get(thread.id);
       const broadcastTitle = getCleanTitle(thread.title, thread.id);
@@ -620,7 +621,7 @@ class CodexFollowerCore {
 
     // Look up the original server request to respond with the correct ID
     const pending = this.pendingApprovals.get(approvalId);
-    if (pending) {
+    if (pending && pending.requestId != null) {
       this.pendingApprovals.delete(approvalId);
       const result = this.buildApprovalResult(pending.method, decision);
       this.transport.respondToServer(pending.requestId, result);
@@ -634,10 +635,18 @@ class CodexFollowerCore {
       return { ok: true, responded: true };
     }
 
+    if (pending) this.pendingApprovals.delete(approvalId);
+
     // Fallback: send as a new request
+    const transportApprovalId = pending && pending.source === "ipc-state"
+      ? pending.transportApprovalId
+      : approvalId;
+    const transportDecision = pending && pending.source === "ipc-state"
+      ? (decision === "allow" ? "accept" : "cancel")
+      : decision;
     const response = await this.transport.request(
       "thread-follower-command-approval-decision",
-      { conversationId, approvalId, decision }
+      { conversationId, approvalId: transportApprovalId, decision: transportDecision }
     );
     this.events.publish({
       type: "approval_response",
@@ -718,6 +727,22 @@ class CodexFollowerCore {
     };
     this.events.on("*", forward);
     scoped.unsubscribe = () => this.events.off("*", forward);
+    queueMicrotask(() => {
+      for (const [approvalId, pending] of this.pendingApprovals) {
+        if (pending.conversationId !== conversationId) continue;
+        scoped.publish({
+          type: "approval_request",
+          conversationId,
+          approvalId,
+          method: pending.method,
+          raw: pending.raw || {
+            id: approvalId,
+            method: pending.method,
+            params: pending.params
+          }
+        });
+      }
+    });
     return scoped;
   }
 
@@ -812,6 +837,8 @@ class CodexFollowerCore {
     });
     this.threads.set(conversationId, threadFromState(conversationId, storedState));
 
+    this.publishApprovalRequestsFromState(conversationId, storedState, message);
+
     this.events.publish({
       type: "thread_state_changed",
       conversationId,
@@ -821,6 +848,51 @@ class CodexFollowerCore {
     });
 
     this.publishTurnEvents(conversationId, storedState, message);
+  }
+
+  publishApprovalRequestsFromState(conversationId, state, raw) {
+    if (!state || !Object.prototype.hasOwnProperty.call(state, "requests")) return;
+
+    const requests = approvalRequestsFromState(state.requests, conversationId);
+    const activeIds = new Set();
+    for (const request of requests) {
+      if (!request.approvalId) continue;
+      activeIds.add(request.approvalId);
+      if (this.pendingApprovals.has(request.approvalId)) continue;
+
+      const rawRequest = {
+        id: request.approvalId,
+        method: request.method,
+        params: request.params,
+        source: "ipc-state",
+        broadcast: raw
+      };
+      this.pendingApprovals.set(request.approvalId, {
+        requestId: null,
+        method: request.method,
+        params: request.params,
+        transportApprovalId: request.transportApprovalId,
+        conversationId,
+        source: "ipc-state",
+        raw: rawRequest,
+        createdAt: Date.now()
+      });
+      this.events.publish({
+        type: "approval_request",
+        conversationId,
+        approvalId: request.approvalId,
+        method: request.method,
+        raw: rawRequest
+      });
+    }
+
+    for (const [approvalId, pending] of this.pendingApprovals) {
+      if (pending.source === "ipc-state"
+        && pending.conversationId === conversationId
+        && !activeIds.has(approvalId)) {
+        this.pendingApprovals.delete(approvalId);
+      }
+    }
   }
 
   handleFollowingChanged(message) {
@@ -987,6 +1059,80 @@ function threadFromState(conversationId, state) {
     runtimeStatus: state.threadRuntimeStatus || null,
     raw: state
   };
+}
+
+function isArchivedRolloutPath(filePath) {
+  return typeof filePath === "string"
+    && filePath.toLowerCase().includes(`${path.sep}archived_sessions${path.sep}`);
+}
+
+function approvalRequestsFromState(rawRequests, conversationId) {
+  const entries = rawRequests && typeof rawRequests === "object"
+    && !Array.isArray(rawRequests)
+    && rawRequests.method
+    && rawRequests.params
+    ? [["request", rawRequests]]
+    : Array.isArray(rawRequests)
+    ? rawRequests.map((value, index) => [String(index), value])
+    : rawRequests && typeof rawRequests === "object"
+      ? Object.entries(rawRequests)
+      : [];
+  const result = [];
+
+  for (const [key, raw] of entries) {
+    const request = raw && raw.request && typeof raw.request === "object" ? raw.request : raw;
+    if (!request || typeof request !== "object") continue;
+    const params = request.params && typeof request.params === "object"
+      ? request.params
+      : request;
+    const method = request.method
+      || (isCommandApproval(params) ? "item/commandExecution/requestApproval" : null)
+      || (isFileApproval(params) ? "item/fileChange/requestApproval" : null)
+      || (isPermissionApproval(params) ? "item/permissions/requestApproval" : null);
+    if (!method || !isApprovalMethod(method)) continue;
+
+    const transportApprovalId = request.id
+      ?? request.requestId
+      ?? params.approvalId
+      ?? params.itemId
+      ?? (key && !/^\d+$/.test(key) ? key : "");
+    const approvalId = String(
+      request.approvalId
+      || request.requestId
+      || request.id
+      || params.approvalId
+      || params.itemId
+      || (key && !/^\d+$/.test(key) ? key : "")
+      || ""
+    );
+    if (!approvalId) continue;
+    result.push({
+      approvalId,
+      transportApprovalId,
+      method,
+      params: {
+        ...params,
+        threadId: params.threadId || conversationId
+      }
+    });
+  }
+  return result;
+}
+
+function isApprovalMethod(method) {
+  return /requestapproval|request_approval/i.test(String(method || ""));
+}
+
+function isCommandApproval(value) {
+  return Boolean(value && (value.command || value.commandActions || value.availableDecisions));
+}
+
+function isFileApproval(value) {
+  return Boolean(value && (value.fileChanges || value.changes || value.patch));
+}
+
+function isPermissionApproval(value) {
+  return Boolean(value && (value.permissions || value.permissionRequest));
 }
 
 function applyStatePatches(previous, patches) {

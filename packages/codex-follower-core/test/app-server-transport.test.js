@@ -2,11 +2,13 @@
 
 const assert = require("node:assert/strict");
 const { AppServerTransport } = require("../src/app-server-transport");
+const { IpcTransport } = require("../src/ipc-transport");
 const { CodexFollowerCore } = require("../src");
 
 const conversationId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
-assert.equal(new CodexFollowerCore().transport.constructor.name, "AppServerTransport");
+assert.equal(new CodexFollowerCore().transport.constructor.name, "IpcTransport");
+assert.equal(new CodexFollowerCore({ transportMode: "app-server" }).transport.constructor.name, "AppServerTransport");
 assert.equal(
   new CodexFollowerCore().buildStartTurnParams(conversationId, "test", {}).approvalPolicy,
   "untrusted"
@@ -74,4 +76,92 @@ core.handleBroadcast({
 assert.equal(interrupted.turnId, "turn-failed");
 assert.equal(interrupted.status, "failed");
 
-process.stdout.write("app-server transport test passed\n");
+(async () => {
+  const approvalRequests = [];
+  const approvalTransport = {
+    requests: [],
+    on() {},
+    request(method, params) {
+      this.requests.push({ method, params });
+      return Promise.resolve({ resultType: "success" });
+    },
+    send() {},
+    disconnect() {}
+  };
+  const approvalCore = new CodexFollowerCore({ transport: approvalTransport });
+  approvalCore.events.on("approval_request", (event) => approvalRequests.push(event));
+  approvalCore.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId,
+      change: {
+        type: "snapshot",
+        revision: 1,
+        conversationState: {
+          title: "approval",
+          requests: {
+            method: "item/commandExecution/requestApproval",
+            id: 897,
+            params: {
+              command: "Get-Date",
+              cwd: "F:\\approval",
+              availableDecisions: ["accept", "cancel"],
+              itemId: "item-approval-1",
+              turnId: "turn-approval-1"
+            }
+          },
+          turns: []
+        }
+      }
+    }
+  });
+  assert.equal(approvalRequests.length, 1);
+  assert.equal(approvalRequests[0].approvalId, "897");
+  assert.equal(approvalRequests[0].raw.params.command, "Get-Date");
+  const replayedApprovals = [];
+  const scoped = approvalCore.subscribeEvents(conversationId);
+  scoped.on("approval_request", (event) => replayedApprovals.push(event));
+  await Promise.resolve();
+  assert.equal(replayedApprovals.length, 1, "existing IPC approval must replay to a new iLink subscription");
+  if (scoped.unsubscribe) scoped.unsubscribe();
+  approvalCore.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId,
+      change: {
+        type: "patches",
+        baseRevision: 1,
+        revision: 2,
+        patches: [{
+          op: "replace",
+          path: ["requests"],
+          value: {
+            method: "item/commandExecution/requestApproval",
+            id: 897,
+            params: {
+              command: "Get-Date",
+              cwd: "F:\\approval",
+              availableDecisions: ["accept", "cancel"],
+              itemId: "item-approval-1",
+              turnId: "turn-approval-1"
+            }
+          }
+        }]
+      }
+    }
+  });
+  assert.equal(approvalRequests.length, 1, "same IPC approval must not duplicate");
+  await approvalCore.approve(conversationId, "897", "allow");
+  assert.deepEqual(approvalTransport.requests[0], {
+    method: "thread-follower-command-approval-decision",
+    params: { conversationId, approvalId: 897, decision: "accept" }
+  });
+  process.stdout.write("app-server transport test passed\n");
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

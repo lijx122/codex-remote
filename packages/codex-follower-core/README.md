@@ -1,8 +1,9 @@
 # codex-follower-core
 
-The current Codex App Server transport is the default. Approval policy defaults to
-`untrusted` when a thread does not provide one. Set `CODEX_TRANSPORT=ipc` only when
-an older Desktop IPC runtime is explicitly required.
+The current Desktop IPC transport is the default so approvals remain visible in the
+Desktop UI. The App Server transport remains available with
+`transportMode: "app-server"`. Approval policy defaults to `untrusted` when a
+thread does not provide one.
 
 Reusable core layer for controlling the current Codex Desktop follower runtime.
 

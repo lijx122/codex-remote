@@ -153,10 +153,12 @@ function loadUpdatesCursor() {
 function saveUpdatesCursor(cursor) {
   try {
     fs.mkdirSync(RUNTIME_DIR, { recursive: true });
-    fs.writeFileSync(UPDATES_STATE_FILE, JSON.stringify({
+    const tempFile = `${UPDATES_STATE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify({
       getUpdatesBuf: cursor,
       savedAt: new Date().toISOString()
     }, null, 2), "utf8");
+    fs.renameSync(tempFile, UPDATES_STATE_FILE);
   } catch (error) {
     writeRuntimeEvent({ direction: "runtime", status: "updates_cursor_save_failed", error }, process.stderr);
   }

@@ -20,6 +20,7 @@ const ids = {
   rolloutLifecycle: "99999999-9999-4999-8999-999999999999",
   v11Broadcast: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
   resetBroadcast: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  archivedBroadcast: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
 };
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-follower-"));
@@ -48,6 +49,7 @@ try {
       source: JSON.stringify({ subagent: { thread_spawn: { parent_thread_id: ids.userIndexed } } }),
       thread_source: "subagent",
     },
+    { id: ids.archivedBroadcast, title: "archived broadcast", archived: 1, thread_source: "user" },
   ]);
 
   const core = new CodexFollowerCore({ codexHome: tmp });
@@ -63,6 +65,12 @@ try {
     updatedAt: "2026-01-05T00:00:00.000Z",
     raw: { thread_source: "subagent" },
   });
+  core.threads.set(ids.archivedBroadcast, {
+    id: ids.archivedBroadcast,
+    title: "archived broadcast",
+    updatedAt: "2026-01-06T00:00:00.000Z",
+    raw: { thread_source: "user" },
+  });
 
   const listedIds = new Set(core.listThreads().map((thread) => thread.id));
 
@@ -74,6 +82,7 @@ try {
   assert.equal(listedIds.has(ids.subIndexedDb), false);
   assert.equal(listedIds.has(ids.subDbOnly), false);
   assert.equal(listedIds.has(ids.subBroadcast), false);
+  assert.equal(listedIds.has(ids.archivedBroadcast), false);
 
   let interruptedTurn = null;
   core.events.on("turn_interrupted", (event) => {
