@@ -644,9 +644,19 @@ class CodexFollowerCore {
     const transportDecision = pending && pending.source === "ipc-state"
       ? (decision === "allow" ? "accept" : "decline")
       : decision;
+    const transportMethod = pending && pending.source === "ipc-state"
+      ? approvalTransportMethod(pending.method)
+      : "thread-follower-command-approval-decision";
+    const approvalResult = pending && pending.source === "ipc-state"
+      ? this.buildApprovalResult(pending.method, decision)
+      : null;
+    const requestParams = pending && pending.source === "ipc-state"
+      && transportMethod === "thread-follower-permissions-request-approval-response"
+      ? { conversationId, requestId: transportApprovalId, response: approvalResult }
+      : { conversationId, requestId: transportApprovalId, decision: transportDecision };
     const response = await this.transport.request(
-      "thread-follower-command-approval-decision",
-      { conversationId, requestId: transportApprovalId, decision: transportDecision }
+      transportMethod,
+      requestParams
     );
     this.events.publish({
       type: "approval_response",
@@ -1132,6 +1142,16 @@ function isFileApproval(value) {
 
 function isPermissionApproval(value) {
   return Boolean(value && (value.permissions || value.permissionRequest));
+}
+
+function approvalTransportMethod(method) {
+  if (String(method || "").includes("permissions")) {
+    return "thread-follower-permissions-request-approval-response";
+  }
+  if (String(method || "").includes("fileChange")) {
+    return "thread-follower-file-approval-decision";
+  }
+  return "thread-follower-command-approval-decision";
 }
 
 function applyStatePatches(previous, patches) {

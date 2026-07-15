@@ -192,6 +192,44 @@ assert.equal(interrupted.status, "failed");
     method: "thread-follower-command-approval-decision",
     params: { conversationId, requestId: 898, decision: "decline" }
   });
+  approvalCore.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId,
+      change: {
+        type: "snapshot",
+        revision: 4,
+        conversationState: {
+          title: "approval",
+          requests: {
+            method: "item/permissions/requestApproval",
+            id: 899,
+            params: {
+              permissions: { fileSystem: { read: true } },
+              reason: "temporary read access",
+              turnId: "turn-approval-3"
+            }
+          },
+          turns: []
+        }
+      }
+    }
+  });
+  await approvalCore.approve(conversationId, "899", "allow");
+  assert.deepEqual(approvalTransport.requests[2], {
+    method: "thread-follower-permissions-request-approval-response",
+    params: {
+      conversationId,
+      requestId: 899,
+      response: {
+        permissions: { fileSystem: {}, network: {} },
+        scope: "turn",
+        strictAutoReview: false
+      }
+    }
+  });
   process.stdout.write("app-server transport test passed\n");
 })().catch((error) => {
   console.error(error);
