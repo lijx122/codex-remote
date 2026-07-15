@@ -19,6 +19,11 @@ export interface CodexFollowerOptions {
   clientType?: string;
   timeoutMs?: number;
   codexHome?: string;
+  transportMode?: "app-server" | "ipc";
+  appServerCommand?: string;
+  cwd?: string;
+  trace?: boolean;
+  traceFile?: string;
 }
 
 export interface ThreadSummary {

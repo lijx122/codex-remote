@@ -11,6 +11,7 @@ try {
   // Optional: state_5.sqlite filtering is skipped if better-sqlite3 is not installed
 }
 const { IpcTransport } = require("./ipc-transport");
+const { AppServerTransport } = require("./app-server-transport");
 const { CodexFollowerEventBus } = require("./event-bus");
 
 const INTERRUPTED_TURN_STATUSES = new Set([
@@ -19,12 +20,16 @@ const INTERRUPTED_TURN_STATUSES = new Set([
   "canceled",
   "cancelled",
   "aborted",
-  "stopped"
+  "stopped",
+  "failed",
+  "error"
 ]);
 
 class CodexFollowerCore {
   constructor(options = {}) {
-    this.transport = new IpcTransport(options);
+    const transportMode = options.transportMode || process.env.CODEX_TRANSPORT || "app-server";
+    this.transport = options.transport
+      || (transportMode === "ipc" ? new IpcTransport(options) : new AppServerTransport(options));
     this.events = new CodexFollowerEventBus();
     this.threads = new Map();
     this.histories = new Map();
@@ -42,6 +47,9 @@ class CodexFollowerCore {
       this.connected = false;
     });
     this.transport.on("error", (error) => {
+      this.events.publish({ type: "error", error, raw: error });
+    });
+    this.transport.on("notification-error", (error) => {
       this.events.publish({ type: "error", error, raw: error });
     });
   }
@@ -943,10 +951,14 @@ class CodexFollowerCore {
   buildStartTurnParams(conversationId, text, state) {
     const settings = state && state.latestThreadSettings ? state.latestThreadSettings : {};
     const permissions = state && state.currentPermissions ? state.currentPermissions : {};
+    const approvalPolicy = process.env.CODEX_APPROVAL_POLICY
+      || settings.approvalPolicy
+      || permissions.approvalPolicy
+      || "untrusted";
     return {
       threadId: conversationId,
       input: [{ type: "text", text, text_elements: [] }],
-      approvalPolicy: settings.approvalPolicy || permissions.approvalPolicy || "never",
+      approvalPolicy,
       approvalsReviewer: settings.approvalsReviewer || permissions.approvalsReviewer || "user",
       sandboxPolicy: settings.sandboxPolicy || permissions.sandboxPolicy || { type: "workspaceWrite" },
       model: settings.model || null,

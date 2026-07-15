@@ -35,7 +35,9 @@ class WxBotAdapter {
     this.awaitingTurnStart = false;
     this.activeTurnId = "";
     this.pendingApprovalId = "";
+    this.pendingApprovalCommand = "";
     this.socket = null;
+    this.socketGeneration = 0;
     this.reconnectTimer = null;
     this.restoreState();
   }
@@ -217,6 +219,7 @@ class WxBotAdapter {
     }
     const approvalId = this.pendingApprovalId;
     this.pendingApprovalId = "";
+    this.pendingApprovalCommand = "";
     await this.client.approve(this.currentConversationId, approvalId, allow);
     await this.reply(allow ? "已批准" : "已拒绝");
   }
@@ -275,6 +278,7 @@ class WxBotAdapter {
 
   connectEvents() {
     if (!this.currentConversationId) return;
+    const generation = ++this.socketGeneration;
     if (this.socket) {
       this.socket.close();
       this.socket = null;
@@ -290,7 +294,11 @@ class WxBotAdapter {
         this.handleEvent(event).catch((error) => this.handleEventError(event, error));
       },
       error: (error) => this.logger.warn && this.logger.warn(errorMessage(error)),
-      close: () => this.scheduleReconnect(conversationId)
+      close: () => {
+        if (generation !== this.socketGeneration) return;
+        this.socket = null;
+        this.scheduleReconnect(conversationId);
+      }
     });
   }
 
@@ -322,10 +330,12 @@ class WxBotAdapter {
     const payload = event.payload || event;
     const approvalId = event.approvalId || payload.approvalId || payload.id || "";
     if (!approvalId) return;
-    this.pendingApprovalId = approvalId;
     const raw = payload.raw || event.raw || {};
     const params = raw.params || {};
     const command = raw.command || params.command || params.cmd || "";
+    if (this.pendingApprovalId === approvalId && this.pendingApprovalCommand === command) return;
+    this.pendingApprovalId = approvalId;
+    this.pendingApprovalCommand = command;
     await this.reply([
       "需要审批：",
       command || JSON.stringify(raw),
@@ -593,7 +603,9 @@ function isInterruptedTurnStatus(status) {
     || normalized === "canceled"
     || normalized === "cancelled"
     || normalized === "aborted"
-    || normalized === "stopped";
+    || normalized === "stopped"
+    || normalized === "failed"
+    || normalized === "error";
 }
 
 function createWxBotAdapter(options) {

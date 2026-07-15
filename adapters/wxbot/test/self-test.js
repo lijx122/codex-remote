@@ -17,6 +17,7 @@ class FakeClient {
     this.sent = [];
     this.approvals = [];
     this.interrupted = [];
+    this.sockets = [];
     this.threads = [
       { conversationId: "019ee451-eed0-7c21-b1a6-8e56d603e82b", title: "微信Adapter开发", updatedAt: new Date().toISOString(), sendable: true }
     ];
@@ -70,7 +71,13 @@ class FakeClient {
 
   connectEvents(conversationId, handlers) {
     this.handlers = handlers;
-    return { close() {} };
+    const socket = {
+      close: () => {
+        if (handlers.close) handlers.close();
+      }
+    };
+    this.sockets.push(socket);
+    return socket;
   }
 }
 
@@ -130,13 +137,20 @@ class FakeClient {
     stateFile
   });
   assert.equal(restoredAdapter.currentConversationId, adapter.currentConversationId);
+  const socketsBeforeSend = client.sockets.length;
 
   await adapter.handleText("修复 bug");
   assert.equal(client.sent[0].message, "修复 bug");
   assert.match(replies.at(-1), /运行中/);
 
+  await new Promise((resolve) => setTimeout(resolve, 2100));
+  assert.equal(client.sockets.length, socketsBeforeSend + 1, "replacing an event socket must not schedule a reconnect");
+
   await adapter.handleEvent({ type: "approval_request", conversationId: adapter.currentConversationId, payload: { approvalId: "a1", raw: { command: "git push origin main" } } });
   assert.equal(adapter.pendingApprovalId, "a1");
+  const approvalPromptCount = replies.length;
+  await adapter.handleEvent({ type: "approval_request", conversationId: adapter.currentConversationId, payload: { approvalId: "a1", raw: { command: "git push origin main" } } });
+  assert.equal(replies.length, approvalPromptCount, "duplicate approval requests must not duplicate iLink prompts");
   assert.match(replies.at(-1), /git push origin main/);
 
   await adapter.handleText("/y");

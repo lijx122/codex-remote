@@ -326,6 +326,11 @@ async function run() {
 
     ilink.enqueue(textMessage("approval entry job"));
     await waitFor(() => hasText(ilink.sent, "需要审批"), 5000, "approval request");
+    assert.equal(
+      ilink.sent.filter((entry) => extractText(entry).includes("echo approved")).length,
+      1,
+      "one approval request must produce one iLink prompt"
+    );
     ilink.enqueue(textMessage("/y"));
     await waitFor(() => control.approvals.length === 1 && hasText(ilink.sent, "已批准"), 5000, "approval response");
 
@@ -357,6 +362,12 @@ async function run() {
 
 function hasText(sent, text) {
   return sent.some((entry) => entry.msg && entry.msg.item_list && entry.msg.item_list.some((item) => item.text_item && String(item.text_item.text).includes(text)));
+}
+
+function extractText(entry) {
+  return entry && entry.msg && Array.isArray(entry.msg.item_list)
+    ? entry.msg.item_list.map((item) => item && item.text_item && item.text_item.text || "").join("\n")
+    : "";
 }
 
 async function waitFor(predicate, timeoutMs, label) {
