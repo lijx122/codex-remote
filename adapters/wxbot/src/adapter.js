@@ -332,13 +332,18 @@ class WxBotAdapter {
     if (!approvalId) return;
     const raw = payload.raw || event.raw || {};
     const params = raw.params || {};
-    const command = raw.command || params.command || params.cmd || "";
+    const command = raw.command
+      || params.command
+      || params.cmd
+      || (Array.isArray(params.commandActions)
+        ? params.commandActions.map((action) => action && (action.command || action.cmd)).filter(Boolean).join(" && ")
+        : "");
     if (this.pendingApprovalId === approvalId && this.pendingApprovalCommand === command) return;
     this.pendingApprovalId = approvalId;
     this.pendingApprovalCommand = command;
     await this.reply([
       "需要审批：",
-      command || JSON.stringify(raw),
+      command || "Desktop 请求确认一项命令操作",
       "",
       "回复 /y 批准，/n 拒绝"
     ].join("\n"));

@@ -642,11 +642,11 @@ class CodexFollowerCore {
       ? pending.transportApprovalId
       : approvalId;
     const transportDecision = pending && pending.source === "ipc-state"
-      ? (decision === "allow" ? "accept" : "cancel")
+      ? (decision === "allow" ? "accept" : "decline")
       : decision;
     const response = await this.transport.request(
       "thread-follower-command-approval-decision",
-      { conversationId, approvalId: transportApprovalId, decision: transportDecision }
+      { conversationId, requestId: transportApprovalId, decision: transportDecision }
     );
     this.events.publish({
       type: "approval_response",
@@ -864,8 +864,7 @@ class CodexFollowerCore {
         id: request.approvalId,
         method: request.method,
         params: request.params,
-        source: "ipc-state",
-        broadcast: raw
+        source: "ipc-state"
       };
       this.pendingApprovals.set(request.approvalId, {
         requestId: null,
