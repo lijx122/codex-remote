@@ -657,7 +657,28 @@ class CodexFollowerCore {
     const response = await this.transport.request(
       transportMethod,
       requestParams
-    );
+    ).catch(async (error) => {
+      if (!isConnectionClosedError(error)) {
+        if (pending) this.pendingApprovals.set(approvalId, pending);
+        throw error;
+      }
+
+      const confirmed = await this.confirmApprovalAfterDisconnect(
+        conversationId,
+        approvalId,
+        pending,
+        error
+      );
+      if (!confirmed) {
+        if (pending) this.pendingApprovals.set(approvalId, pending);
+        throw error;
+      }
+      return {
+        resultType: "success",
+        recoveredAfterDisconnect: true,
+        error: error.message
+      };
+    });
     this.events.publish({
       type: "approval_response",
       conversationId,
@@ -665,7 +686,63 @@ class CodexFollowerCore {
       decision,
       raw: response
     });
-    return { ok: true, raw: response };
+    return {
+      ok: true,
+      confirmed: response && (
+        response.recoveredAfterDisconnect === true
+        || response.resultType === "success"
+      ) ? true : undefined,
+      raw: response
+    };
+  }
+
+  async confirmApprovalAfterDisconnect(conversationId, approvalId, pending, error) {
+    const initialWait = await this.waitForApprovalToLeaveState(
+      conversationId,
+      approvalId,
+      pending,
+      1500
+    );
+    if (initialWait) return true;
+
+    if (typeof this.transport.reconnect !== "function") return false;
+    try {
+      await this.transport.reconnect();
+      this.connected = true;
+    } catch (reconnectError) {
+      this.publishDiagnostic(
+        "approval-reconnect-failed",
+        conversationId,
+        { approvalId, error: error && error.message },
+        reconnectError
+      );
+      return false;
+    }
+
+    return this.waitForApprovalToLeaveState(
+      conversationId,
+      approvalId,
+      pending,
+      2500
+    );
+  }
+
+  async waitForApprovalToLeaveState(conversationId, approvalId, pending, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() <= deadline) {
+      const state = this.histories.get(conversationId);
+      if (state && Object.prototype.hasOwnProperty.call(state, "requests")) {
+        const active = approvalRequestsFromState(state.requests, conversationId);
+        const stillPending = active.some((request) => approvalRequestMatches(
+          request,
+          approvalId,
+          pending
+        ));
+        if (!stillPending) return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
   }
 
   buildApprovalResult(method, decision) {
@@ -1152,6 +1229,27 @@ function approvalTransportMethod(method) {
     return "thread-follower-file-approval-decision";
   }
   return "thread-follower-command-approval-decision";
+}
+
+function approvalRequestMatches(request, approvalId, pending) {
+  const requestIds = [
+    request && request.approvalId,
+    request && request.transportApprovalId,
+    request && request.params && request.params.approvalId,
+    request && request.params && request.params.itemId
+  ].filter((value) => value != null).map(String);
+  const pendingIds = [
+    approvalId,
+    pending && pending.requestId,
+    pending && pending.transportApprovalId,
+    pending && pending.params && pending.params.approvalId,
+    pending && pending.params && pending.params.itemId
+  ].filter((value) => value != null).map(String);
+  return requestIds.some((value) => pendingIds.includes(value));
+}
+
+function isConnectionClosedError(error) {
+  return /codex IPC connection closed/i.test(String(error && error.message || error));
 }
 
 function applyStatePatches(previous, patches) {

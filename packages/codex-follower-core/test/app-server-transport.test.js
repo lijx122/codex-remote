@@ -230,6 +230,63 @@ assert.equal(interrupted.status, "failed");
       }
     }
   });
+
+  const disconnectingTransport = {
+    requests: [],
+    on() {},
+    request(method, params) {
+      this.requests.push({ method, params });
+      return Promise.reject(new Error("codex IPC connection closed"));
+    },
+    send() {},
+    disconnect() {}
+  };
+  const disconnectingCore = new CodexFollowerCore({ transport: disconnectingTransport });
+  disconnectingCore.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId,
+      change: {
+        type: "snapshot",
+        revision: 5,
+        conversationState: {
+          title: "approval",
+          requests: {
+            method: "item/permissions/requestApproval",
+            id: 900,
+            params: {
+              permissions: { fileSystem: { read: true } },
+              reason: "temporary read access",
+              turnId: "turn-approval-4"
+            }
+          },
+          turns: []
+        }
+      }
+    }
+  });
+  setTimeout(() => disconnectingCore.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId,
+      change: {
+        type: "snapshot",
+        revision: 6,
+        conversationState: {
+          title: "approval",
+          requests: [],
+          turns: [{ turnId: "turn-approval-4", status: "running", items: [] }]
+        }
+      }
+    }
+  }), 10);
+  const recovered = await disconnectingCore.approve(conversationId, "900", "allow");
+  assert.equal(recovered.ok, true, "approval must be confirmed by live state after IPC disconnect");
+  assert.equal(recovered.confirmed, true);
   process.stdout.write("app-server transport test passed\n");
 })().catch((error) => {
   console.error(error);

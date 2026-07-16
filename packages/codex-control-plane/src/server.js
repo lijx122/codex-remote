@@ -288,8 +288,12 @@ function createControlPlaneServer(options = {}) {
           decision
         });
         const result = await core.approve(body.conversationId, body.approvalId, decision);
-        logCommand("approve.result", { conversationId: body.conversationId, ok: result.ok });
-        await sendJson(res, 200, { ok: result.ok });
+        logCommand("approve.result", {
+          conversationId: body.conversationId,
+          ok: result.ok,
+          confirmed: result.confirmed ?? null
+        });
+        await sendJson(res, 200, { ok: result.ok, confirmed: result.confirmed ?? null });
         return;
       }
 

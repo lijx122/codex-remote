@@ -156,6 +156,20 @@ class FakeClient {
   await adapter.handleText("/y");
   assert.equal(client.approvals[0].decision, true);
 
+  await adapter.handleEvent({
+    type: "approval_request",
+    conversationId: adapter.currentConversationId,
+    payload: { approvalId: "a2", raw: { command: "echo retry" } }
+  });
+  const approveFailure = client.approve;
+  client.approve = async () => {
+    throw new Error("codex IPC connection closed");
+  };
+  await adapter.handleText("/y");
+  assert.equal(adapter.pendingApprovalId, "a2", "failed approval must remain retryable");
+  assert.match(replies.at(-1), /codex IPC connection closed/);
+  client.approve = approveFailure;
+
   await adapter.handleEvent({ type: "turn_started", conversationId: adapter.currentConversationId, payload: { turnId: "t1" } });
   await adapter.handleEvent({ type: "turn_completed", conversationId: adapter.currentConversationId, payload: { turnId: "t1" } });
   assert.equal(settledCount, 1);

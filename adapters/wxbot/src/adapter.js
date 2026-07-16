@@ -218,9 +218,12 @@ class WxBotAdapter {
       return;
     }
     const approvalId = this.pendingApprovalId;
+    const result = await this.client.approve(this.currentConversationId, approvalId, allow);
+    if (!result || result.ok !== true) {
+      throw new Error("Desktop 未确认审批结果");
+    }
     this.pendingApprovalId = "";
     this.pendingApprovalCommand = "";
-    await this.client.approve(this.currentConversationId, approvalId, allow);
     await this.reply(allow ? "已批准" : "已拒绝");
   }
 
