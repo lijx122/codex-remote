@@ -36,7 +36,8 @@ class CodexFollowerCore {
     this.streamStates = new Map();
     this.pendingApprovals = new Map();
     this.lastPublishedTurnEvents = new Map();
-    this.resyncPromise = null;
+    this.resyncPromises = new Map();
+    this.resyncingConversations = new Set();
     this.connected = false;
     this.codexHome = options.codexHome || defaultCodexHome();
     this.openThread = options.openThread || openThreadDeepLink;
@@ -45,6 +46,10 @@ class CodexFollowerCore {
     this.transport.on("server-request", (message) => this.handleServerRequest(message));
     this.transport.on("close", () => {
       this.connected = false;
+      this.threads.clear();
+      this.histories.clear();
+      this.streamStates.clear();
+      this.pendingApprovals.clear();
     });
     this.transport.on("error", (error) => {
       this.events.publish({ type: "error", error, raw: error });
@@ -836,7 +841,9 @@ class CodexFollowerCore {
   handleBroadcast(message) {
     if (message.method === "ipc-connection-reset") {
       this.threads.clear();
+      this.histories.clear();
       this.streamStates.clear();
+      this.pendingApprovals.clear();
       this.publishDiagnostic("ipc-connection-reset", null, message);
       return;
     }
@@ -885,7 +892,9 @@ class CodexFollowerCore {
       }
       if (tracked && tracked.owner === owner && tracked.revision === revision) return;
       state = change.conversationState;
+      this.resyncingConversations.delete(conversationId);
     } else if (isPatchChange(change)) {
+      if (this.resyncingConversations.has(conversationId)) return;
       const patches = patchListFromChange(change);
       if (tracked && tracked.revision === revision) return;
       if (
@@ -901,7 +910,10 @@ class CodexFollowerCore {
       try {
         state = applyStatePatches(this.histories.get(conversationId), patches);
       } catch (error) {
+        this.resyncingConversations.add(conversationId);
+        this.histories.delete(conversationId);
         this.invalidateLiveThread(conversationId, "stream-patch-failed", message, tracked, error);
+        this.streamStates.delete(conversationId);
         this.requestStreamResync(conversationId);
         return;
       }
@@ -1004,17 +1016,21 @@ class CodexFollowerCore {
   }
 
   requestStreamResync(conversationId) {
-    if (this.resyncPromise) return;
-    this.resyncPromise = Promise.resolve()
-      .then(() => this.transport.reconnect())
+    if (this.resyncPromises.has(conversationId)) return;
+    const resyncPromise = Promise.resolve()
+      .then(() => this.transport.request(
+        "thread-follower-load-complete-history",
+        { conversationId }
+      ))
       .then((result) => {
         this.connected = true;
         return result;
       })
       .catch((error) => this.publishDiagnostic("stream-resync-failed", conversationId, null, error))
       .finally(() => {
-        this.resyncPromise = null;
+        this.resyncPromises.delete(conversationId);
       });
+    this.resyncPromises.set(conversationId, resyncPromise);
   }
 
   publishDiagnostic(code, conversationId, raw, error) {

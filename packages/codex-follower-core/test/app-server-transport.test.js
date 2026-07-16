@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const { AppServerTransport } = require("../src/app-server-transport");
 const { IpcTransport } = require("../src/ipc-transport");
 const { CodexFollowerCore } = require("../src");
@@ -287,6 +288,92 @@ assert.equal(interrupted.status, "failed");
   const recovered = await disconnectingCore.approve(conversationId, "900", "allow");
   assert.equal(recovered.ok, true, "approval must be confirmed by live state after IPC disconnect");
   assert.equal(recovered.confirmed, true);
+
+  const resyncTransport = new EventEmitter();
+  resyncTransport.reconnect = async () => {
+    throw new Error("global reconnect must not be used for a patch resync");
+  };
+  resyncTransport.requests = [];
+  resyncTransport.request = async (method, params) => {
+    resyncTransport.requests.push({ method, params });
+    return { resultType: "success" };
+  };
+  resyncTransport.send = () => ({ accepted: true });
+  resyncTransport.disconnect = () => {};
+  const resyncCore = new CodexFollowerCore({ transport: resyncTransport });
+  resyncCore.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId,
+      change: {
+        type: "snapshot",
+        revision: 10,
+        conversationState: {
+          title: "resync",
+          turns: [{ turnId: "turn-resync", status: "running", items: [] }]
+        }
+      }
+    }
+  });
+  resyncCore.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId,
+      change: {
+        type: "patches",
+        baseRevision: 10,
+        revision: 11,
+        patches: [{
+          op: "add",
+          path: ["turns", "3"],
+          value: { turnId: "turn-out-of-range", status: "running", items: [] }
+        }]
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(resyncTransport.requests, [{
+    method: "thread-follower-load-complete-history",
+    params: { conversationId }
+  }]);
+  assert.equal(resyncCore.histories.has(conversationId), false, "failed patch must discard stale baseline");
+  assert.equal(resyncCore.streamStates.has(conversationId), false, "failed patch must discard stale stream state");
+  resyncCore.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId,
+      change: {
+        type: "snapshot",
+        revision: 20,
+        conversationState: {
+          title: "resync snapshot",
+          turns: [{ turnId: "turn-resync", status: "running", items: [] }]
+        }
+      }
+    }
+  });
+  assert.equal(resyncCore.resyncingConversations.has(conversationId), false);
+  resyncCore.handleBroadcast({
+    type: "broadcast",
+    version: 11,
+    method: "thread-stream-state-changed",
+    params: {
+      conversationId,
+      change: {
+        type: "patches",
+        baseRevision: 20,
+        revision: 21,
+        patches: [{ op: "replace", path: ["title"], value: "resync patched" }]
+      }
+    }
+  });
+  assert.equal(resyncCore.histories.get(conversationId).title, "resync patched");
   process.stdout.write("app-server transport test passed\n");
 })().catch((error) => {
   console.error(error);
